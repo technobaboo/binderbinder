@@ -1,0 +1,15 @@
+[package]
+name = "binderbinder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustix = { version = "1.1.3", features = ["fs", "mount"] }
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+byteorder = "1.5"
+log = "0.4"
+env_logger = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

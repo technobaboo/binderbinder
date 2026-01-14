@@ -1,0 +1,484 @@
+use byteorder::{LittleEndian, WriteBytesExt};
+use std::io::{Cursor, Write};
+
+use super::sys::{
+    binder_transaction_data, binder_uintptr_t, flat_binder_object, BINDER_TYPE_BINDER,
+    BINDER_TYPE_FD, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
+};
+
+use super::binder_ref::BinderRef;
+
+pub const BINDER_MAX_TYPE: usize = 6;
+
+pub enum BinderObjectEntry {
+    Handle {
+        handle: u32,
+    },
+    Fd {
+        fd: i32,
+    },
+    Binder {
+        ptr: binder_uintptr_t,
+        cookie: binder_uintptr_t,
+    },
+}
+
+impl BinderObjectEntry {
+    pub fn from_flat(flat: &flat_binder_object) -> Option<BinderObjectEntry> {
+        match flat.hdr.type_ {
+            BINDER_TYPE_BINDER => Some(BinderObjectEntry::Binder {
+                ptr: flat.binder,
+                cookie: flat.cookie,
+            }),
+            BINDER_TYPE_HANDLE => Some(BinderObjectEntry::Handle {
+                handle: flat.binder as u32,
+            }),
+            BINDER_TYPE_FD => Some(BinderObjectEntry::Fd {
+                fd: flat.binder as i32,
+            }),
+            BINDER_TYPE_WEAK_BINDER => Some(BinderObjectEntry::Binder {
+                ptr: flat.binder,
+                cookie: flat.cookie,
+            }),
+            BINDER_TYPE_WEAK_HANDLE => Some(BinderObjectEntry::Handle {
+                handle: flat.binder as u32,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn to_flat(&self) -> flat_binder_object {
+        let mut flat = flat_binder_object::default();
+
+        match self {
+            BinderObjectEntry::Handle { handle } => {
+                flat.hdr.type_ = BINDER_TYPE_HANDLE;
+                flat.binder = *handle as binder_uintptr_t;
+            }
+            BinderObjectEntry::Fd { fd } => {
+                flat.hdr.type_ = BINDER_TYPE_FD;
+                flat.binder = *fd as binder_uintptr_t;
+            }
+            BinderObjectEntry::Binder { ptr, cookie } => {
+                flat.hdr.type_ = BINDER_TYPE_BINDER;
+                flat.binder = *ptr;
+                flat.cookie = *cookie;
+            }
+        }
+
+        flat
+    }
+}
+
+pub struct Payload {
+    pub data: Vec<u8>,
+    pub objects: Vec<BinderObjectEntry>,
+}
+
+impl Payload {
+    pub fn with_data(data: Vec<u8>) -> Self {
+        Payload {
+            data,
+            objects: Vec::new(),
+        }
+    }
+
+    pub fn add_binder(&mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) {
+        self.objects.push(BinderObjectEntry::Binder { ptr, cookie });
+    }
+
+    pub fn add_handle(&mut self, handle: u32) {
+        self.objects.push(BinderObjectEntry::Handle { handle });
+    }
+
+    pub fn add_fd(&mut self, fd: i32) {
+        self.objects.push(BinderObjectEntry::Fd { fd });
+    }
+
+    pub fn add_weak_binder(&mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) {
+        self.objects.push(BinderObjectEntry::Binder { ptr, cookie });
+    }
+
+    pub fn add_weak_handle(&mut self, handle: u32) {
+        self.objects.push(BinderObjectEntry::Handle { handle });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.objects.is_empty()
+    }
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Payload {
+            data: Vec::new(),
+            objects: Vec::new(),
+        }
+    }
+}
+
+pub struct Transaction {
+    pub code: u32,
+    pub payload: Payload,
+    pub reply_tx: tokio::sync::oneshot::Sender<Payload>,
+}
+
+impl Transaction {
+    pub fn reply(self, payload: Payload) {
+        let _ = self.reply_tx.send(payload);
+    }
+}
+
+pub enum BinderObject {
+    Binder {
+        ptr: binder_uintptr_t,
+        cookie: binder_uintptr_t,
+    },
+    Handle {
+        handle: u32,
+    },
+    Fd {
+        fd: i32,
+    },
+    WeakBinder {
+        ptr: binder_uintptr_t,
+        cookie: binder_uintptr_t,
+    },
+    WeakHandle {
+        handle: u32,
+    },
+}
+
+impl BinderObject {
+    pub fn to_flat(&self) -> flat_binder_object {
+        let mut flat = flat_binder_object::default();
+
+        match self {
+            BinderObject::Binder { ptr, cookie } => {
+                flat.hdr.type_ = BINDER_TYPE_BINDER;
+                flat.binder = *ptr;
+                flat.cookie = *cookie;
+            }
+            BinderObject::Handle { handle } => {
+                flat.hdr.type_ = BINDER_TYPE_HANDLE;
+                flat.binder = *handle as binder_uintptr_t;
+            }
+            BinderObject::Fd { fd } => {
+                flat.hdr.type_ = BINDER_TYPE_FD;
+                flat.binder = *fd as binder_uintptr_t;
+            }
+            BinderObject::WeakBinder { ptr, cookie } => {
+                flat.hdr.type_ = BINDER_TYPE_WEAK_BINDER;
+                flat.binder = *ptr;
+                flat.cookie = *cookie;
+            }
+            BinderObject::WeakHandle { handle } => {
+                flat.hdr.type_ = BINDER_TYPE_WEAK_HANDLE;
+                flat.binder = *handle as binder_uintptr_t;
+            }
+        }
+
+        flat
+    }
+}
+
+pub struct TransactionData {
+    pub target: BinderRef,
+    pub code: u32,
+    pub flags: u32,
+    data: Vec<u8>,
+    objects: Vec<BinderObject>,
+}
+
+impl TransactionData {
+    pub fn new(target: BinderRef, code: u32, flags: u32) -> Self {
+        TransactionData {
+            target,
+            code,
+            flags,
+            data: Vec::new(),
+            objects: Vec::new(),
+        }
+    }
+
+    pub fn with_payload(mut self, payload: &[u8]) -> Self {
+        self.data.extend_from_slice(payload);
+        self
+    }
+
+    pub fn add_fd(mut self, fd: i32) -> Self {
+        self.objects.push(BinderObject::Fd { fd });
+        self
+    }
+
+    pub fn add_handle(mut self, handle: u32) -> Self {
+        self.objects.push(BinderObject::Handle { handle });
+        self
+    }
+
+    pub fn add_binder(mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) -> Self {
+        self.objects.push(BinderObject::Binder { ptr, cookie });
+        self
+    }
+
+    pub fn add_weak_handle(mut self, handle: u32) -> Self {
+        self.objects.push(BinderObject::WeakHandle { handle });
+        self
+    }
+
+    pub fn add_weak_binder(mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) -> Self {
+        self.objects.push(BinderObject::WeakBinder { ptr, cookie });
+        self
+    }
+
+    pub fn build(self) -> (Vec<u8>, Vec<flat_binder_object>) {
+        let flat_obj_size = std::mem::size_of::<flat_binder_object>();
+        eprintln!("DEBUG: flat_binder_object size = {}", flat_obj_size);
+        eprintln!("DEBUG: data.len() = {}", self.data.len());
+        eprintln!("DEBUG: objects.len() = {}", self.objects.len());
+
+        let mut flat_objects = Vec::with_capacity(self.objects.len());
+        let mut offsets = Vec::with_capacity(self.objects.len());
+
+        for obj in self.objects {
+            let flat = obj.to_flat();
+            let offset = self.data.len() + offsets.len() * std::mem::size_of::<binder_uintptr_t>();
+            eprintln!("DEBUG: object {}, offset = {}", offsets.len(), offset);
+            offsets.push(offset as binder_uintptr_t);
+            flat_objects.push(flat);
+        }
+
+        let mut tx_data = Vec::with_capacity(
+            std::mem::size_of::<binder_transaction_data>()
+                + self.data.len()
+                + offsets.len() * std::mem::size_of::<binder_uintptr_t>()
+                + flat_objects.len() * std::mem::size_of::<flat_binder_object>(),
+        );
+
+        eprintln!("DEBUG: tx_data capacity = {}", tx_data.capacity());
+        eprintln!(
+            "DEBUG: binder_transaction_data size = {}",
+            std::mem::size_of::<binder_transaction_data>()
+        );
+        eprintln!("DEBUG: data.len() = {}", self.data.len());
+        eprintln!("DEBUG: offsets.len() = {}", offsets.len());
+        eprintln!("DEBUG: flat_objects.len() = {}", flat_objects.len());
+        eprintln!(
+            "DEBUG: flat_object size = {}",
+            std::mem::size_of::<flat_binder_object>()
+        );
+        eprintln!(
+            "DEBUG: offset size = {}",
+            std::mem::size_of::<binder_uintptr_t>()
+        );
+        eprintln!(
+            "DEBUG: expected total = {} + {} + {} * {} + {} * {} = {}",
+            std::mem::size_of::<binder_transaction_data>(),
+            self.data.len(),
+            offsets.len(),
+            std::mem::size_of::<binder_uintptr_t>(),
+            flat_objects.len(),
+            std::mem::size_of::<flat_binder_object>(),
+            std::mem::size_of::<binder_transaction_data>()
+                + self.data.len()
+                + offsets.len() * std::mem::size_of::<binder_uintptr_t>()
+                + flat_objects.len() * std::mem::size_of::<flat_binder_object>(),
+        );
+
+        eprintln!("DEBUG: tx_data capacity = {}", tx_data.capacity());
+        eprintln!(
+            "DEBUG: binder_transaction_data size = {}",
+            std::mem::size_of::<binder_transaction_data>()
+        );
+        eprintln!("DEBUG: data.len() = {}", self.data.len());
+        eprintln!("DEBUG: flat_objects.len() = {}", flat_objects.len());
+        eprintln!(
+            "DEBUG: flat_object size = {}",
+            std::mem::size_of::<flat_binder_object>()
+        );
+        eprintln!(
+            "DEBUG: expected total = {} + {} + {} * {} = {}",
+            std::mem::size_of::<binder_transaction_data>(),
+            self.data.len(),
+            flat_objects.len(),
+            std::mem::size_of::<flat_binder_object>(),
+            std::mem::size_of::<binder_transaction_data>()
+                + self.data.len()
+                + flat_objects.len() * std::mem::size_of::<flat_binder_object>(),
+        );
+
+        let mut cursor = Cursor::new(&mut tx_data);
+
+        cursor
+            .write_u64::<LittleEndian>(self.target.as_u32() as u64)
+            .unwrap();
+        cursor.write_u64::<LittleEndian>(0).unwrap();
+        cursor.write_u32::<LittleEndian>(self.code).unwrap();
+        cursor.write_u32::<LittleEndian>(self.flags).unwrap();
+        cursor.write_u64::<LittleEndian>(0).unwrap();
+        cursor.write_u64::<LittleEndian>(0).unwrap();
+        cursor
+            .write_u64::<LittleEndian>(self.data.len() as u64)
+            .unwrap();
+        cursor
+            .write_u64::<LittleEndian>(offsets.len() as u64)
+            .unwrap();
+
+        cursor.write_all(&self.data).unwrap();
+
+        for offset in offsets {
+            cursor.write_u64::<LittleEndian>(offset).unwrap();
+            eprintln!("DEBUG: writing offset {}", offset);
+        }
+
+        for (i, flat) in flat_objects.iter().enumerate() {
+            let flat_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    flat as *const flat_binder_object as *const u8,
+                    std::mem::size_of::<flat_binder_object>(),
+                )
+            };
+            cursor.write_all(flat_bytes).unwrap();
+            eprintln!("DEBUG: writing flat object {}: {:02x?}", i, flat_bytes);
+        }
+
+        eprintln!("DEBUG: final tx_data.len() = {}", tx_data.len());
+        eprintln!("DEBUG: tx_data as hex: {:02x?}", &tx_data);
+
+        (tx_data, flat_objects)
+    }
+
+    pub fn parse_reply(data: &[u8]) -> (Vec<u8>, Vec<BinderObjectEntry>) {
+        if data.len() < std::mem::size_of::<binder_transaction_data>() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let data_size_offset = 7 * 8;
+        let offsets_size_offset = 8 * 8;
+        let data_size = u64::from_le_bytes(
+            data[data_size_offset..data_size_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let offsets_size = u64::from_le_bytes(
+            data[offsets_size_offset..offsets_size_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+
+        let data_start = std::mem::size_of::<binder_transaction_data>();
+        let offsets_start = data_start + data_size as usize;
+        let _objects_start = offsets_start + offsets_size as usize;
+
+        let reply_data = if data_size > 0 {
+            data[data_start..offsets_start].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let mut objects = Vec::new();
+
+        if offsets_size > 0 {
+            let num_offsets = offsets_size as usize / std::mem::size_of::<binder_uintptr_t>();
+
+            for i in 0..num_offsets {
+                let offset_offset = offsets_start + i * std::mem::size_of::<binder_uintptr_t>();
+                let offset =
+                    u64::from_le_bytes(data[offset_offset..offset_offset + 8].try_into().unwrap());
+
+                let obj_index = (offset as usize) / std::mem::size_of::<flat_binder_object>();
+                let obj_offset = data_start + obj_index * std::mem::size_of::<flat_binder_object>();
+
+                if obj_offset + std::mem::size_of::<flat_binder_object>() <= data.len() {
+                    let flat_ptr = data
+                        [obj_offset..obj_offset + std::mem::size_of::<flat_binder_object>()]
+                        .as_ptr() as *const flat_binder_object;
+                    let flat = unsafe { &*flat_ptr };
+                    if let Some(obj) = BinderObjectEntry::from_flat(flat) {
+                        objects.push(obj);
+                    }
+                }
+            }
+        }
+
+        (reply_data, objects)
+    }
+}
+
+pub struct FlatBinderObjectBuilder {
+    object: flat_binder_object,
+}
+
+impl FlatBinderObjectBuilder {
+    pub fn new() -> Self {
+        FlatBinderObjectBuilder {
+            object: flat_binder_object::default(),
+        }
+    }
+
+    pub fn binder(mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) -> Self {
+        self.object.hdr.type_ = BINDER_TYPE_BINDER;
+        self.object.binder = ptr;
+        self.object.cookie = cookie;
+        self
+    }
+
+    pub fn handle(mut self, handle: u32) -> Self {
+        self.object.hdr.type_ = BINDER_TYPE_HANDLE;
+        self.object.binder = handle as binder_uintptr_t;
+        self
+    }
+
+    pub fn fd(mut self, fd: i32) -> Self {
+        self.object.hdr.type_ = BINDER_TYPE_FD;
+        self.object.binder = fd as binder_uintptr_t;
+        self
+    }
+
+    pub fn weak_binder(mut self, ptr: binder_uintptr_t, cookie: binder_uintptr_t) -> Self {
+        self.object.hdr.type_ = BINDER_TYPE_WEAK_BINDER;
+        self.object.binder = ptr;
+        self.object.cookie = cookie;
+        self
+    }
+
+    pub fn weak_handle(mut self, handle: u32) -> Self {
+        self.object.hdr.type_ = BINDER_TYPE_WEAK_HANDLE;
+        self.object.binder = handle as binder_uintptr_t;
+        self
+    }
+
+    pub fn build(self) -> flat_binder_object {
+        self.object
+    }
+}
+
+impl Default for FlatBinderObjectBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+use crate::*;
+
+#[test]
+fn test_payload() {
+    let mut payload = Payload::with_data(b"hello world".to_vec());
+    payload.add_handle(42);
+    payload.add_fd(123);
+    payload.add_binder(0xDEADBEEF, 0xCAFEBABE);
+    assert!(!payload.is_empty());
+    assert_eq!(payload.data, b"hello world");
+    assert_eq!(payload.objects.len(), 3);
+}
+
+#[test]
+fn test_transaction_data() {
+    let target = BinderRef::from_raw(123);
+    let tx_data = TransactionData::new(target, 0x1234, 0x01)
+        .with_payload(b"hello")
+        .add_handle(42);
+    let (data, objects) = tx_data.build();
+    assert!(!data.is_empty());
+    assert_eq!(objects.len(), 1);
+}
