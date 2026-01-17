@@ -5,7 +5,7 @@ use std::io;
 pub enum Error {
     Io(io::Error),
     Os(i32),
-    Binder(i32),
+    Binder(rustix::io::Errno),
     InvalidHandle(u32),
     HandleNotFound(u32),
     InvalidTransaction,

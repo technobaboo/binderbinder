@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
+
+use crate::sys::SetContextMGR;
 
 use super::binder_ref::BinderRef;
 use super::error::{Error, Result};
@@ -75,11 +77,11 @@ pub struct BinderDevice {
 
 impl BinderDevice {
     pub async fn open(file: File) -> Result<Self> {
-        let raw_fd = file.into_raw_fd();
+        let fd = OwnedFd::from(file);
 
         let (msg_tx, msg_rx) = mpsc::channel(32);
 
-        let task = tokio::task::spawn_local(run_actor(raw_fd, msg_rx)).abort_handle();
+        let task = tokio::task::spawn_local(run_actor(fd, msg_rx)).abort_handle();
 
         let device = BinderDevice {
             cookie_counter: AtomicU64::new(1),
@@ -150,9 +152,9 @@ impl Drop for BinderDevice {
     }
 }
 
-async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
-    eprintln!("Creating AsyncFd for fd={}", raw_fd);
-    let async_fd = match AsyncFd::new(raw_fd) {
+async fn run_actor(fd: OwnedFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
+    eprintln!("Creating AsyncFd for fd={}", fd.as_raw_fd());
+    let async_fd = match AsyncFd::new(fd) {
         Ok(fd) => {
             eprintln!("AsyncFd created successfully");
             fd
@@ -182,7 +184,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                         let tx_data = TransactionData::new(target, code, 0);
                         let (data, _objects) = tx_data.with_payload(&payload.data).build();
 
-                        send_transaction_sync(raw_fd, &data);
+                        send_transaction_sync(async_fd.get_ref().as_fd(), &data);
 
                         let pending = PendingReply {
                             tx: reply_tx,
@@ -192,7 +194,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                     }
                     Some(ActorMessage::TransactOneWay { target, code, payload }) => {
                         eprintln!("TransactOneWay: target={:?}, code={}", target, code);
-                        handle_transact_one_way(raw_fd, target, code, payload).await;
+                        handle_transact_one_way(async_fd.get_ref().as_fd(), target, code, payload).await;
                     }
                     Some(ActorMessage::Register { cookie, tx }) => {
                         eprintln!("Register: cookie=0x{:x}", cookie);
@@ -208,7 +210,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                             let _ = reply_tx.send(Err(Error::AlreadyExists));
                             continue;
                         }
-                        match set_context_manager(raw_fd).await {
+                        match set_context_manager(async_fd.get_ref().as_fd()).await {
                             Ok(()) => {
                                 context_manager_set = true;
                                 let _ = reply_tx.send(Ok(BinderRef(0)));
@@ -221,7 +223,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                     }
                     Some(ActorMessage::Reply { payload, reply_tx: _ }) => {
                         eprintln!("Reply: payload.len={}", payload.data.len());
-                        send_bc_reply(raw_fd, &payload);
+                        send_bc_reply(async_fd.get_ref().as_fd(), &payload);
                     }
                     Some(ActorMessage::Shutdown) | None => {
                         eprintln!("Shutdown received");
@@ -273,7 +275,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                                 BR_NOOP => { eprintln!("BR_NOOP"); }
                                 BR_TRANSACTION => {
                                     eprintln!("BR_TRANSACTION received!");
-                                    if let Some(tx) = parse_br_transaction(raw_fd, &wr, &commands) {
+                                    if let Some(tx) = parse_br_transaction(async_fd.get_ref().as_fd(), &wr, &commands) {
                                         let cookie = extract_cookie(&wr);
                                         eprintln!("  cookie=0x{:x}", cookie);
                                         if let Some(object_tx) = registry.get(&cookie) {
@@ -321,14 +323,19 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
     shutdown_actor(&mut pending_replies, &mut registry);
 }
 
-async fn handle_transact_one_way(raw_fd: RawFd, target: BinderRef, code: u32, payload: Payload) {
+async fn handle_transact_one_way(
+    fd: BorrowedFd<'_>,
+    target: BinderRef,
+    code: u32,
+    payload: Payload,
+) {
     let tx_data = TransactionData::new(target, code, TF_ONE_WAY);
     let (data, _objects) = tx_data.with_payload(&payload.data).build();
 
-    send_transaction_sync(raw_fd, &data);
+    send_transaction_sync(fd, &data);
 }
 
-fn send_transaction_sync(fd: RawFd, data: &[u8]) {
+fn send_transaction_sync(fd: BorrowedFd<'_>, data: &[u8]) {
     let wr = binder_write_read {
         write_buffer: data.as_ptr() as BinderUintptrT,
         write_size: data.len() as BinderSizeT,
@@ -338,7 +345,7 @@ fn send_transaction_sync(fd: RawFd, data: &[u8]) {
         read_consumed: 0,
     };
 
-    let res = unsafe { rustix::ioctl::ioctl(rustix::fd::BorrowedFd::borrow_raw(fd), wr) };
+    let res = unsafe { rustix::ioctl::ioctl(fd, wr) };
 
     if res.is_err() {
         let err = std::io::Error::last_os_error();
@@ -413,7 +420,7 @@ fn send_binder_transaction(fd: RawFd, data: &[u8]) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("send_binder_transaction error: {:?}", e);
-            Err(Error::Binder(-1))
+            Err(Error::Binder(e))
         }
     }
 }
@@ -424,7 +431,7 @@ fn send_binder_transaction_sync(fd: RawFd, data: &[u8]) -> Result<()> {
     send_binder_transaction(fd, data)
 }
 
-fn send_bc_reply(fd: RawFd, payload: &Payload) {
+fn send_bc_reply(fd: BorrowedFd<'_>, payload: &Payload) {
     let tx_data = TransactionData::new(BinderRef(0), 0, 0);
     let (data, _objects) = tx_data.with_payload(&payload.data).build();
 
@@ -441,7 +448,7 @@ fn send_bc_reply(fd: RawFd, payload: &Payload) {
         read_buffer: 0,
     };
 
-    let res = unsafe { rustix::ioctl::ioctl(rustix::fd::BorrowedFd::borrow_raw(fd), wr) };
+    let res = unsafe { rustix::ioctl::ioctl(fd, wr) };
     if res.is_err() {
         let err = std::io::Error::last_os_error();
         eprintln!("send_bc_reply error: {:?}", err);
@@ -500,13 +507,13 @@ fn read_binder_reply_sync(fd: RawFd) -> Result<Payload> {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                return Err(Error::Binder(-1));
+                return Err(Error::Binder(e));
             }
         }
     }
 }
 
-async fn set_context_manager(fd: RawFd) -> Result<()> {
+async fn set_context_manager(fd: BorrowedFd<'_>) -> Result<()> {
     let mut fbo = flat_binder_object::default();
     fbo.hdr.type_ = BINDER_TYPE_BINDER;
     fbo.binder = 0;
@@ -518,20 +525,11 @@ async fn set_context_manager(fd: RawFd) -> Result<()> {
         "Calling BINDER_SET_CONTEXT_MGR ioctl with fbo at {:p}...",
         fbo_ptr
     );
-    let res = unsafe {
-        libc::ioctl(
-            fd,
-            BINDER_SET_CONTEXT_MGR as u64,
-            fbo_ptr as *mut std::ffi::c_void,
-        )
-    };
+    let res = unsafe { rustix::ioctl::ioctl(fd, SetContextMGR(fbo)) }.map_err(Error::Binder);
 
-    eprintln!("BINDER_SET_CONTEXT_MGR returned: {}", res);
-
-    if res < 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = res {
         eprintln!("BINDER_SET_CONTEXT_MGR error: {:?}", err);
-        return Err(Error::Binder(res));
+        return Err(err);
     }
 
     eprintln!("Context manager set successfully!");
@@ -539,7 +537,7 @@ async fn set_context_manager(fd: RawFd) -> Result<()> {
 }
 
 fn parse_br_transaction(
-    _fd: RawFd,
+    _fd: BorrowedFd<'_>,
     wr: &binder_write_read,
     _commands: &[u32],
 ) -> Option<Transaction> {
