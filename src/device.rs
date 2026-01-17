@@ -1,23 +1,21 @@
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
-use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
-
-use crate::sys::SetContextMGR;
-
 use super::binder_ref::BinderRef;
 use super::error::{Error, Result};
 use super::sys::{
     binder_transaction_data, binder_write_read, flat_binder_object, BinderSizeT, BinderUintptrT,
-    BC_REPLY, BC_TRANSACTION, BINDER_SET_CONTEXT_MGR, BINDER_TYPE_BINDER, BINDER_WRITE_READ,
-    BR_DEAD_REPLY, BR_NOOP, BR_REPLY, BR_TRANSACTION, BR_TRANSACTION_COMPLETE, TF_ONE_WAY,
+    BC_REPLY, BC_TRANSACTION, BINDER_TYPE_BINDER, BINDER_WRITE_READ, BR_DEAD_REPLY, BR_NOOP,
+    BR_REPLY, BR_TRANSACTION, BR_TRANSACTION_COMPLETE, TF_ONE_WAY,
 };
 use super::transaction::{Payload, Transaction, TransactionData};
+use crate::sys::SetContextMGR;
+use crate::BinderObject;
+use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::unix::AsyncFd;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 enum ActorMessage {
     TransactTwoWay {
@@ -52,21 +50,6 @@ enum ActorMessage {
 struct PendingReply {
     tx: oneshot::Sender<Result<Payload>>,
     target: BinderRef,
-}
-
-pub struct BinderObject {
-    pub cookie: BinderUintptrT,
-    rx: mpsc::Receiver<Transaction>,
-}
-
-impl BinderObject {
-    pub fn cookie(&self) -> BinderUintptrT {
-        self.cookie
-    }
-
-    pub async fn recv_transaction(&mut self) -> Option<Transaction> {
-        self.rx.recv().await
-    }
 }
 
 pub struct BinderDevice {
@@ -400,7 +383,7 @@ fn send_binder_transaction(fd: RawFd, data: &[u8]) -> Result<()> {
         &write_buf[80..std::cmp::min(88, write_buf.len())]
     );
 
-    let mut wr = binder_write_read {
+    let wr = binder_write_read {
         write_buffer: write_buf.as_ptr() as BinderUintptrT,
         write_size: write_buf.len() as BinderSizeT,
         write_consumed: 0,
