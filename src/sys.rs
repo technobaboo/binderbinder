@@ -1,4 +1,5 @@
 use rustix::ffi::c_void;
+use rustix::ioctl::Opcode;
 use rustix::ioctl::{opcode::read_write, Ioctl};
 
 pub type BinderSizeT = u64;
@@ -285,4 +286,29 @@ async fn test_version_ioctl() {
     let result = unsafe { rustix::ioctl::ioctl(&file, version) };
     assert!(result.is_ok());
     assert_eq!(result.unwrap().protocol_version, 8);
+}
+pub struct SetContextMGR(pub flat_binder_object);
+unsafe impl Ioctl for SetContextMGR {
+    type Output = ();
+
+    const IS_MUTATING: bool = true;
+
+    fn opcode(&self) -> rustix::ioctl::Opcode {
+        rw_op::<Self>(BINDER_SET_CONTEXT_MGR as u8)
+    }
+
+    fn as_ptr(&mut self) -> *mut rustix::ffi::c_void {
+        self as *mut _ as *mut _
+    }
+
+    unsafe fn output_from_ptr(
+        _out: rustix::ioctl::IoctlOutput,
+        _extract_output: *mut rustix::ffi::c_void,
+    ) -> rustix::io::Result<Self::Output> {
+        Ok(())
+    }
+}
+
+const fn rw_op<T>(opcode: u8) -> Opcode {
+    read_write::<T>(b'b', opcode)
 }
