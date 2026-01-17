@@ -1,13 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{AbortHandle, LocalSet};
+use tokio::task::AbortHandle;
 
 use super::binder_ref::BinderRef;
 use super::error::{Error, Result};
@@ -428,12 +428,36 @@ fn send_binder_transaction_sync(fd: RawFd, data: &[u8]) -> Result<()> {
     send_binder_transaction(fd, data)
 }
 
+fn send_bc_reply(fd: RawFd, payload: &Payload) {
+    let tx_data = TransactionData::new(BinderRef(0), 0, 0);
+    let (data, _objects) = tx_data.with_payload(&payload.data).build();
+
+    let mut write_buf = Vec::with_capacity(4 + data.len());
+    write_buf.extend_from_slice(&BC_REPLY.to_le_bytes());
+    write_buf.extend_from_slice(&data);
+
+    let wr = binder_write_read {
+        write_buffer: write_buf.as_ptr() as binder_uintptr_t,
+        write_size: write_buf.len() as binder_size_t,
+        write_consumed: 0,
+        read_size: 0,
+        read_consumed: 0,
+        read_buffer: 0,
+    };
+
+    let res = unsafe { rustix::ioctl::ioctl(rustix::fd::BorrowedFd::borrow_raw(fd), wr) };
+    if res.is_err() {
+        let err = std::io::Error::last_os_error();
+        eprintln!("send_bc_reply error: {:?}", err);
+    }
+}
+
 fn read_binder_reply_sync(fd: RawFd) -> Result<Payload> {
     let read_buf_size = 256 * 1024;
     let mut read_buf = vec![0u8; read_buf_size];
 
     loop {
-        let mut wr = binder_write_read {
+        let wr = binder_write_read {
             write_size: 0,
             write_consumed: 0,
             write_buffer: 0,
@@ -471,9 +495,6 @@ fn read_binder_reply_sync(fd: RawFd) -> Result<Payload> {
                         }
                         BR_SPAWN_LOOPER => {
                             eprintln!("Child: got BR_SPAWN_LOOPER");
-                        }
-                        _ => {
-                            eprintln!("Child: unhandled cmd=0x{:x}", cmd);
                         }
                     }
                 }
@@ -607,7 +628,7 @@ fn handle_br_dead_reply(pending_replies: &mut VecDeque<PendingReply>) {
     }
 }
 
-fn process_reply_queue(fd: RawFd, reply_queue: &mut VecDeque<Payload>) {
+fn process_reply_queue(fd: BorrowedFd, reply_queue: &mut VecDeque<Payload>) {
     while let Some(payload) = reply_queue.pop_front() {
         let payload: &Payload = &payload;
         let tx_data = TransactionData::new(BinderRef(0), 0, 0);
@@ -618,7 +639,7 @@ fn process_reply_queue(fd: RawFd, reply_queue: &mut VecDeque<Payload>) {
         write_buf.extend_from_slice(&bc_reply_cmd.to_le_bytes());
         write_buf.extend_from_slice(&data);
 
-        let mut wr = binder_write_read {
+        let wr = binder_write_read {
             write_buffer: write_buf.as_ptr() as binder_uintptr_t,
             write_size: write_buf.len() as binder_size_t,
             write_consumed: 0,
@@ -671,8 +692,6 @@ impl<T: Send + Sync + 'static> BinderService<T> {
         BinderService { actor, handler }
     }
 }
-
-use crate::*;
 
 #[tokio::test]
 async fn test_device_creation() {

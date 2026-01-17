@@ -459,8 +459,6 @@ impl Default for FlatBinderObjectBuilder {
     }
 }
 
-use crate::*;
-
 #[test]
 fn test_payload() {
     let mut payload = Payload::with_data(b"hello world".to_vec());

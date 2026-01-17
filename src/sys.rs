@@ -287,8 +287,6 @@ unsafe impl Ioctl for binderfs_device {
     }
 }
 
-use crate::*;
-
 #[tokio::test]
 async fn test_version_ioctl() {
     let file = std::fs::File::open("/dev/binderfs/testbinder").expect(
