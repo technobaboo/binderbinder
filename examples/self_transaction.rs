@@ -1,5 +1,4 @@
 use binderbinder::{BinderDevice, BinderRef, Payload};
-use std::os::fd::AsRawFd;
 
 extern crate libc;
 

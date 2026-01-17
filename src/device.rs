@@ -3,7 +3,6 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
@@ -12,14 +11,11 @@ use tokio::task::AbortHandle;
 use super::binder_ref::BinderRef;
 use super::error::{Error, Result};
 use super::sys::{
-    binder_size_t, binder_transaction_data, binder_uintptr_t, binder_write_read,
-    flat_binder_object, BC_REPLY, BC_TRANSACTION, BINDER_SET_CONTEXT_MGR, BINDER_TYPE_BINDER,
-    BINDER_WRITE_READ, BR_DEAD_REPLY, BR_NOOP, BR_REPLY, BR_TRANSACTION, BR_TRANSACTION_COMPLETE,
-    TF_ONE_WAY,
+    binder_transaction_data, binder_write_read, flat_binder_object, BinderSizeT, BinderUintptrT,
+    BC_REPLY, BC_TRANSACTION, BINDER_SET_CONTEXT_MGR, BINDER_TYPE_BINDER, BINDER_WRITE_READ,
+    BR_DEAD_REPLY, BR_NOOP, BR_REPLY, BR_TRANSACTION, BR_TRANSACTION_COMPLETE, TF_ONE_WAY,
 };
 use super::transaction::{Payload, Transaction, TransactionData};
-
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 enum ActorMessage {
     TransactTwoWay {
@@ -34,11 +30,11 @@ enum ActorMessage {
         payload: Payload,
     },
     Register {
-        cookie: binder_uintptr_t,
+        cookie: BinderUintptrT,
         tx: mpsc::Sender<Transaction>,
     },
     Unregister {
-        cookie: binder_uintptr_t,
+        cookie: BinderUintptrT,
     },
     SetContextManager {
         obj: BinderObject,
@@ -57,12 +53,12 @@ struct PendingReply {
 }
 
 pub struct BinderObject {
-    pub cookie: binder_uintptr_t,
+    pub cookie: BinderUintptrT,
     rx: mpsc::Receiver<Transaction>,
 }
 
 impl BinderObject {
-    pub fn cookie(&self) -> binder_uintptr_t {
+    pub fn cookie(&self) -> BinderUintptrT {
         self.cookie
     }
 
@@ -171,7 +167,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
     let mut read_buf = vec![0u8; read_buf_size];
     eprintln!("Read buffer allocated: {} bytes", read_buf_size);
 
-    let mut registry: HashMap<binder_uintptr_t, mpsc::Sender<Transaction>> = HashMap::new();
+    let mut registry: HashMap<BinderUintptrT, mpsc::Sender<Transaction>> = HashMap::new();
     let mut pending_replies: VecDeque<PendingReply> = VecDeque::new();
     let mut context_manager_set = false;
     let mut shutdown = false;
@@ -235,13 +231,13 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
             }
             Ok(mut guard) = async_fd.readable() => {
                 match guard.try_io(|inner| {
-                    let mut wr = binder_write_read {
+                    let wr = binder_write_read {
                         write_size: 0,
                         write_consumed: 0,
                         write_buffer: 0,
-                        read_size: read_buf_size as binder_size_t,
+                        read_size: read_buf_size as BinderSizeT,
                         read_consumed: 0,
-                        read_buffer: read_buf.as_mut_ptr() as binder_uintptr_t,
+                        read_buffer: read_buf.as_mut_ptr() as BinderUintptrT,
                     };
 
                     let res = unsafe {
@@ -259,7 +255,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
                                 let ptr = read_buf.as_ptr() as *const u32;
 
                                 (0..num_cmds)
-                                    .map(|i| unsafe { *ptr.offset(i as isize) })
+                                    .map(|i| unsafe { *ptr.add(i) })
                                     .collect()
                             } else {
                                 Vec::new()
@@ -267,7 +263,7 @@ async fn run_actor(raw_fd: RawFd, mut msg_rx: mpsc::Receiver<ActorMessage>) {
 
                             Ok((wr, commands))
                         }
-                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::Other, "ioctl failed")),
+                            Err(_) => Err(std::io::Error::other("ioctl failed")),
                     }
                 }) {
                     Ok(Ok((wr, commands))) => {
@@ -333,9 +329,9 @@ async fn handle_transact_one_way(raw_fd: RawFd, target: BinderRef, code: u32, pa
 }
 
 fn send_transaction_sync(fd: RawFd, data: &[u8]) {
-    let mut wr = binder_write_read {
-        write_buffer: data.as_ptr() as binder_uintptr_t,
-        write_size: data.len() as binder_size_t,
+    let wr = binder_write_read {
+        write_buffer: data.as_ptr() as BinderUintptrT,
+        write_size: data.len() as BinderSizeT,
         write_consumed: 0,
         read_buffer: 0,
         read_size: 0,
@@ -398,8 +394,8 @@ fn send_binder_transaction(fd: RawFd, data: &[u8]) -> Result<()> {
     );
 
     let mut wr = binder_write_read {
-        write_buffer: write_buf.as_ptr() as binder_uintptr_t,
-        write_size: write_buf.len() as binder_size_t,
+        write_buffer: write_buf.as_ptr() as BinderUintptrT,
+        write_size: write_buf.len() as BinderSizeT,
         write_consumed: 0,
         read_buffer: 0,
         read_size: 0,
@@ -437,8 +433,8 @@ fn send_bc_reply(fd: RawFd, payload: &Payload) {
     write_buf.extend_from_slice(&data);
 
     let wr = binder_write_read {
-        write_buffer: write_buf.as_ptr() as binder_uintptr_t,
-        write_size: write_buf.len() as binder_size_t,
+        write_buffer: write_buf.as_ptr() as BinderUintptrT,
+        write_size: write_buf.len() as BinderSizeT,
         write_consumed: 0,
         read_size: 0,
         read_consumed: 0,
@@ -461,9 +457,9 @@ fn read_binder_reply_sync(fd: RawFd) -> Result<Payload> {
             write_size: 0,
             write_consumed: 0,
             write_buffer: 0,
-            read_size: read_buf_size as binder_size_t,
+            read_size: read_buf_size as BinderSizeT,
             read_consumed: 0,
-            read_buffer: read_buf.as_mut_ptr() as binder_uintptr_t,
+            read_buffer: read_buf.as_mut_ptr() as BinderUintptrT,
         };
 
         let res = unsafe { rustix::ioctl::ioctl(rustix::fd::BorrowedFd::borrow_raw(fd), wr) };
@@ -589,7 +585,7 @@ fn parse_br_transaction(
     Some(tx)
 }
 
-fn extract_cookie(wr: &binder_write_read) -> binder_uintptr_t {
+fn extract_cookie(wr: &binder_write_read) -> BinderUintptrT {
     let data = unsafe {
         std::slice::from_raw_parts(
             wr.read_buffer as *const u8,
@@ -598,8 +594,8 @@ fn extract_cookie(wr: &binder_write_read) -> binder_uintptr_t {
     };
 
     if data.len() >= std::mem::size_of::<binder_transaction_data>() {
-        let cookie_offset = 1 * 8;
-        binder_uintptr_t::from_le_bytes(
+        let cookie_offset = 8;
+        BinderUintptrT::from_le_bytes(
             data[cookie_offset..cookie_offset + 8]
                 .try_into()
                 .ok()
@@ -640,8 +636,8 @@ fn process_reply_queue(fd: BorrowedFd, reply_queue: &mut VecDeque<Payload>) {
         write_buf.extend_from_slice(&data);
 
         let wr = binder_write_read {
-            write_buffer: write_buf.as_ptr() as binder_uintptr_t,
-            write_size: write_buf.len() as binder_size_t,
+            write_buffer: write_buf.as_ptr() as BinderUintptrT,
+            write_size: write_buf.len() as BinderSizeT,
             write_consumed: 0,
             read_size: 0,
             read_consumed: 0,
@@ -649,14 +645,14 @@ fn process_reply_queue(fd: BorrowedFd, reply_queue: &mut VecDeque<Payload>) {
         };
 
         unsafe {
-            rustix::ioctl::ioctl(fd, wr);
+            let _ = rustix::ioctl::ioctl(fd, wr);
         }
     }
 }
 
 fn shutdown_actor(
     pending_replies: &mut VecDeque<PendingReply>,
-    registry: &mut HashMap<binder_uintptr_t, mpsc::Sender<Transaction>>,
+    registry: &mut HashMap<BinderUintptrT, mpsc::Sender<Transaction>>,
 ) {
     while let Some(pending) = pending_replies.pop_front() {
         let _ = pending.tx.send(Err(Error::Shutdown));
@@ -712,7 +708,7 @@ async fn test_object_registration() {
     let device = BinderDevice::open(file)
         .await
         .expect("Could not create device");
-    let obj = device.register_object(0x12345678);
+    let obj = device.register_object();
     assert_eq!(obj.cookie(), 0x12345678);
     drop(obj);
     drop(device);

@@ -1,19 +1,14 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BinderRef(pub u32);
-
 impl BinderRef {
+    pub const CONTEXT_MANAGER: BinderRef = BinderRef(0);
+
     pub fn from_raw(n: u32) -> Self {
         BinderRef(n)
     }
 
     pub fn as_u32(&self) -> u32 {
         self.0
-    }
-}
-
-impl Default for BinderRef {
-    fn default() -> Self {
-        BinderRef(0)
     }
 }
 

@@ -1,8 +1,8 @@
 use rustix::ffi::c_void;
 use rustix::ioctl::{opcode::read_write, Ioctl};
 
-pub type binder_size_t = u64;
-pub type binder_uintptr_t = u64;
+pub type BinderSizeT = u64;
+pub type BinderUintptrT = u64;
 
 pub const BINDER_TYPE_BINDER: u32 = 0x17;
 pub const BINDER_TYPE_WEAK_BINDER: u32 = 0x18;
@@ -87,8 +87,8 @@ pub struct binder_object_header {
 pub struct flat_binder_object {
     pub hdr: binder_object_header,
     pub flags: u32,
-    pub binder: binder_uintptr_t,
-    pub cookie: binder_uintptr_t,
+    pub binder: BinderUintptrT,
+    pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]
@@ -96,9 +96,9 @@ pub struct flat_binder_object {
 pub struct binder_fd_object {
     pub hdr: binder_object_header,
     pub pad_flags: u32,
-    pub pad_binder: binder_uintptr_t,
+    pub pad_binder: BinderUintptrT,
     pub fd: u32,
-    pub cookie: binder_uintptr_t,
+    pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]
@@ -106,10 +106,10 @@ pub struct binder_fd_object {
 pub struct binder_buffer_object {
     pub hdr: binder_object_header,
     pub flags: u32,
-    pub buffer: binder_uintptr_t,
-    pub length: binder_size_t,
-    pub parent: binder_size_t,
-    pub parent_offset: binder_size_t,
+    pub buffer: BinderUintptrT,
+    pub length: BinderSizeT,
+    pub parent: BinderSizeT,
+    pub parent_offset: BinderSizeT,
 }
 
 #[repr(C)]
@@ -117,33 +117,20 @@ pub struct binder_buffer_object {
 pub struct binder_fd_array_object {
     pub hdr: binder_object_header,
     pub pad: u32,
-    pub num_fds: binder_size_t,
-    pub parent: binder_size_t,
-    pub parent_offset: binder_size_t,
+    pub num_fds: BinderSizeT,
+    pub parent: BinderSizeT,
+    pub parent_offset: BinderSizeT,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct binder_write_read {
-    pub write_size: binder_size_t,
-    pub write_consumed: binder_size_t,
-    pub write_buffer: binder_uintptr_t,
-    pub read_size: binder_size_t,
-    pub read_consumed: binder_size_t,
-    pub read_buffer: binder_uintptr_t,
-}
-
-impl Default for binder_write_read {
-    fn default() -> Self {
-        binder_write_read {
-            write_size: 0,
-            write_consumed: 0,
-            write_buffer: 0,
-            read_size: 0,
-            read_consumed: 0,
-            read_buffer: 0,
-        }
-    }
+    pub write_size: BinderSizeT,
+    pub write_consumed: BinderSizeT,
+    pub write_buffer: BinderUintptrT,
+    pub read_size: BinderSizeT,
+    pub read_consumed: BinderSizeT,
+    pub read_buffer: BinderUintptrT,
 }
 
 #[repr(C)]
@@ -155,21 +142,21 @@ pub struct binder_version {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct binder_transaction_data_ptrs {
-    pub buffer: binder_uintptr_t,
-    pub offsets: binder_uintptr_t,
+    pub buffer: BinderUintptrT,
+    pub offsets: BinderUintptrT,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct binder_transaction_data {
-    pub target: binder_uintptr_t,
-    pub cookie: binder_uintptr_t,
+    pub target: BinderUintptrT,
+    pub cookie: BinderUintptrT,
     pub code: u32,
     pub flags: u32,
     pub sender_pid: i32,
     pub sender_euid: i32,
-    pub data_size: binder_size_t,
-    pub offsets_size: binder_size_t,
+    pub data_size: BinderSizeT,
+    pub offsets_size: BinderSizeT,
     pub data: binder_transaction_data_ptrs,
 }
 
@@ -195,15 +182,15 @@ impl Default for binder_transaction_data {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct binder_ptr_cookie {
-    pub ptr: binder_uintptr_t,
-    pub cookie: binder_uintptr_t,
+    pub ptr: BinderUintptrT,
+    pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct binder_handle_cookie {
     pub handle: u32,
-    pub cookie: binder_uintptr_t,
+    pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]

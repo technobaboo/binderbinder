@@ -28,7 +28,7 @@ fn main() {
 
     println!("[1] Mounting binderfs at /dev/binderfs");
 
-    let binderfs = Binderfs::mount().expect("Could not mount binderfs");
+    let binderfs = Binderfs::mount_default().expect("Could not mount binderfs");
 
     println!("    OK: binderfs mounted/ready");
 
