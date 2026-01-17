@@ -78,11 +78,11 @@ impl Drop for ThreadBinderState {
     }
 }
 
-/// TLS - lazily initialized on first access.
-/// Each Tokio worker thread has its own ThreadBinderState.
 thread_local! {
+    /// TLS - lazily initialized on first access.
+    /// Each Tokio worker thread has its own ThreadBinderState.
     static THREAD_STATE: std::cell::RefCell<Option<ThreadBinderState>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Ensure the current thread is registered for the device identified by source_fd.
@@ -276,7 +276,6 @@ fn parse_br_transaction(async_fd: &AsyncFd<OwnedFd>) -> Option<TransactionInfo> 
     }
 
     let data_size_offset = 7 * 8;
-    let offsets_size_offset = 8 * 8;
 
     let data_size = u64::from_le_bytes(
         data[data_size_offset..data_size_offset + 8]

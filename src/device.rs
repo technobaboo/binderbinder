@@ -6,7 +6,10 @@
 //! - Arc<BinderDevice> shared across all tasks
 //! - DashMap for thread-safe pending_replies and service_handlers
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -23,7 +26,6 @@ use crate::sys::{
 use crate::transaction::{Payload, Transaction, TransactionData};
 use dashmap::DashMap;
 use rustix::fd::FromRawFd;
-use std::cell::RefCell;
 
 /// Shared binder device state.
 pub struct BinderDevice {
@@ -181,7 +183,8 @@ impl BinderDevice {
                             &async_fd,
                             Arc::clone(&pending_replies),
                             Arc::clone(&service_handlers),
-                        );
+                        )
+                        .await;
                     }
                 }
                 Ok(Err(_)) => guard.clear_ready(),
@@ -222,7 +225,7 @@ impl BinderDevice {
     }
 
     /// Handle a single binder command.
-    fn handle_command(
+    async fn handle_command(
         cmd: u32,
         async_fd: &AsyncFd<OwnedFd>,
         pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
@@ -232,13 +235,14 @@ impl BinderDevice {
             BR_TRANSACTION => {
                 if let Some((cookie, code, payload_data)) = Self::parse_transaction(async_fd) {
                     eprintln!("BR_TRANSACTION: cookie=0x{:x}", cookie);
-                    if let Some(handler) = service_handlers.get(&cookie) {
+                    if let Some(handler_entry) = service_handlers.get(&cookie) {
                         let transaction = Transaction {
                             code,
                             payload: Payload::with_data(payload_data),
-                            reply_tx: None,
                         };
-                        let _ = handler.tx.send(transaction);
+                        // Call handler asynchronously and send reply
+                        let reply = (handler_entry.handler)(transaction).await;
+                        Self::send_reply(async_fd, &reply.data).await;
                     } else {
                         eprintln!("No handler registered for cookie=0x{:x}", cookie);
                     }
@@ -421,16 +425,49 @@ impl BinderDevice {
         }
     }
 
+    /// Send a BC_REPLY with the given payload.
+    async fn send_reply(async_fd: &AsyncFd<OwnedFd>, data: &[u8]) {
+        let fd = async_fd.get_ref().as_fd();
+
+        let tx_data = TransactionData::new(BinderRef(0), 0, 0);
+        let (reply_data, _objects) = tx_data.with_payload(data).build();
+
+        let mut write_buf = Vec::with_capacity(4 + reply_data.len());
+        write_buf.extend_from_slice(&BC_REPLY.to_le_bytes());
+        write_buf.extend_from_slice(&reply_data);
+
+        let wr = binder_write_read {
+            write_size: write_buf.len() as BinderSizeT,
+            write_consumed: 0,
+            write_buffer: write_buf.as_ptr() as BinderUintptrT,
+            read_size: 0,
+            read_consumed: 0,
+            read_buffer: 0,
+        };
+
+        let res = unsafe { rustix::ioctl::ioctl(fd, wr) };
+        if let Err(e) = res {
+            eprintln!("send_reply error: {:?}", e);
+        }
+    }
+
     /// Register a service handler for incoming transactions.
-    pub fn register_service<F>(self: &Arc<Self>, handler: F) -> ServiceRegistration
+    pub fn register_service<F, Fut>(self: &Arc<Self>, handler: F) -> ServiceRegistration
     where
-        F: Fn(Transaction) -> Payload + Send + Sync + 'static,
+        F: Fn(Transaction) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Payload> + Send + 'static,
     {
         let cookie = self.cookie_counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(32);
+
+        // Box the handler to match the expected type
+        let boxed_handler: Arc<
+            dyn Fn(Transaction) -> Pin<Box<dyn Future<Output = Payload> + Send + 'static>>
+                + Send
+                + Sync,
+        > = Arc::new(move |tx: Transaction| Box::pin(handler(tx)));
 
         let entry = HandlerEntry {
-            tx,
+            handler: boxed_handler,
             _guard: DropGuard {
                 device: Arc::downgrade(self),
                 cookie,
@@ -439,11 +476,7 @@ impl BinderDevice {
 
         self.service_handlers.insert(cookie, entry);
 
-        ServiceRegistration {
-            cookie,
-            rx,
-            handler: Arc::new(handler),
-        }
+        ServiceRegistration { cookie }
     }
 
     /// Send a two-way transaction and wait for reply.
@@ -513,7 +546,11 @@ struct PendingReply {
 
 /// Entry in the service handlers map.
 struct HandlerEntry {
-    tx: mpsc::Sender<Transaction>,
+    handler: Arc<
+        dyn Fn(Transaction) -> Pin<Box<dyn Future<Output = Payload> + Send + 'static>>
+            + Send
+            + Sync,
+    >,
     _guard: DropGuard,
 }
 
@@ -553,21 +590,12 @@ mod WriterState {
 /// Registration handle for a service handler.
 pub struct ServiceRegistration {
     pub cookie: BinderUintptrT,
-    pub(crate) rx: mpsc::Receiver<Transaction>,
-    pub handler: Arc<dyn Fn(Transaction) -> Payload + Send + Sync>,
 }
 
 impl ServiceRegistration {
-    /// Receive the next transaction for this service.
-    pub async fn recv_transaction(&mut self) -> Option<Transaction> {
-        self.rx.recv().await
-    }
-
-    /// Handle the next transaction and send reply.
-    pub async fn handle_next(&mut self) -> Option<Payload> {
-        let tx = self.rx.recv().await?;
-        let reply = (self.handler)(tx);
-        Some(reply)
+    /// Get the cookie for this registration.
+    pub fn cookie(&self) -> BinderUintptrT {
+        self.cookie
     }
 }
 

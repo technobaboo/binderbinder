@@ -110,14 +110,6 @@ impl Payload {
 pub struct Transaction {
     pub code: u32,
     pub payload: Payload,
-    pub reply_tx: Option<tokio::sync::oneshot::Sender<Payload>>,
-}
-impl Transaction {
-    pub fn reply(self, payload: Payload) {
-        if let Some(tx) = self.reply_tx {
-            let _ = tx.send(payload);
-        }
-    }
 }
 
 pub enum BinderObject {
