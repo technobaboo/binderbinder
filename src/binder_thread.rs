@@ -12,8 +12,8 @@
 
 use crate::sys::{
     binder_write_read, BinderUintptrT, BC_EXIT_LOOPER, BC_REGISTER_LOOPER, BC_TRANSACTION,
-    BINDER_WRITE_READ,
 };
+use rustix::fd::FromRawFd;
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use tokio::io::unix::AsyncFd;
@@ -86,13 +86,31 @@ thread_local! {
 }
 
 /// Ensure the current thread is registered for the device identified by source_fd.
-/// Returns an AsyncFd that can be used for async epoll operations.
-pub fn ensure_device_ready(source_fd: RawFd) -> std::io::Result<AsyncFd<OwnedFd>> {
+/// Returns a token that can be used to get the AsyncFd for this device.
+pub fn ensure_device_ready(source_fd: RawFd) -> std::io::Result<DeviceKey> {
     let key = DeviceKey(source_fd);
 
     THREAD_STATE.with_borrow_mut(|cell| {
         let state = cell.get_or_insert_with(ThreadBinderState::new);
-        state.ensure_device(key).map(|afd| afd.clone())
+        state.ensure_device(key)?;
+        Ok(key)
+    })
+}
+
+/// Get the AsyncFd for a device key from TLS.
+/// Must be called on the same thread that called ensure_device_ready.
+pub fn get_device_async_fd(key: DeviceKey) -> Option<AsyncFd<OwnedFd>> {
+    THREAD_STATE.with_borrow_mut(|cell| {
+        if let Some(state) = cell.as_mut() {
+            state.registrations.get(&key).and_then(|reg| {
+                // Create a new AsyncFd wrapping the same OwnedFd
+                // This is safe because we own the fd in the registration
+                let owned = reg.async_fd.get_ref().try_clone().ok()?;
+                AsyncFd::new(owned).ok()
+            })
+        } else {
+            None
+        }
     })
 }
 
@@ -113,12 +131,20 @@ pub fn spawn_receivers_on_all_workers(device_key: DeviceKey, source_fd: RawFd) {
 
 /// Receiver task that handles incoming binder transactions on one worker thread.
 async fn receiver_task(device_key: DeviceKey, source_fd: RawFd) {
-    let async_fd = match ensure_device_ready(source_fd) {
-        Ok(fd) => fd,
-        Err(e) => {
+    if let Err(e) = ensure_device_ready(source_fd) {
+        eprintln!(
+            "binder_thread: failed to register device {:?}: {}",
+            device_key, e
+        );
+        return;
+    }
+
+    let async_fd = match get_device_async_fd(device_key) {
+        Some(fd) => fd,
+        None => {
             eprintln!(
-                "binder_thread: failed to register device {:?}: {}",
-                device_key, e
+                "binder_thread: failed to get device async fd for {:?}",
+                device_key
             );
             return;
         }
@@ -126,7 +152,7 @@ async fn receiver_task(device_key: DeviceKey, source_fd: RawFd) {
 
     loop {
         // Wait for EPOLLIN (readability) via AsyncFd
-        let guard = match async_fd.readable().await {
+        let mut guard = match async_fd.readable().await {
             Ok(guard) => guard,
             Err(e) => {
                 eprintln!("binder_thread: AsyncFd error for {:?}: {}", device_key, e);
@@ -134,14 +160,17 @@ async fn receiver_task(device_key: DeviceKey, source_fd: RawFd) {
             }
         };
 
-        match guard.try_io(|inner| read_binder_commands(inner.as_fd())) {
-            Ok(commands) => {
+        match guard.try_io(|inner| Ok(read_binder_commands(inner.as_fd()))) {
+            Ok(Ok(commands)) => {
                 for cmd in commands {
                     handle_command(cmd, &async_fd, device_key);
                 }
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // WouldBlock - clear ready and retry
+                guard.clear_ready();
+            }
+            Err(_) => {
                 guard.clear_ready();
             }
         }
@@ -301,7 +330,13 @@ fn send_binder_command(fd: std::os::fd::BorrowedFd<'_>, cmd: u32) -> std::io::Re
     };
 
     let res = unsafe { rustix::ioctl::ioctl(fd, wr) };
-    res.map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(0)))
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let errno = e.raw_os_error();
+            Err(std::io::Error::from_raw_os_error(errno))
+        }
+    }
 }
 
 /// Send transaction data via BC_TRANSACTION.
