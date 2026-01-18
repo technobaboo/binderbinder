@@ -8,7 +8,7 @@ pub mod sys;
 pub mod transaction;
 
 pub use binder_ref::BinderRef;
-pub use device::{BinderDevice, BinderProxy, ServiceRegistration};
+pub use device::{BinderDevice, BinderProxy};
 pub use error::{Error, Result};
 pub use object::BinderObject;
 pub use sys::TF_ONE_WAY;

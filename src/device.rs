@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use crate::binder_ref::BinderRef;
 use crate::binder_thread::{self, DeviceKey};
 use crate::error::{Error, Result};
+use crate::object::BinderObject;
 use crate::sys::{
     binder_transaction_data, binder_write_read, BinderSizeT, BinderUintptrT, BC_REPLY,
     BC_TRANSACTION, BR_REPLY, BR_TRANSACTION, TF_ONE_WAY,
@@ -29,13 +30,13 @@ use rustix::fd::FromRawFd;
 
 /// Shared binder device state.
 pub struct BinderDevice {
-    source_fd: RawFd,
-    device_key: DeviceKey,
-    cookie_counter: AtomicU64,
-    pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
-    service_handlers: Arc<DashMap<BinderUintptrT, HandlerEntry>>,
-    writer_task: JoinHandle<()>,
-    service_tasks: Vec<JoinHandle<()>>,
+    pub(crate) source_fd: RawFd,
+    pub(crate) device_key: DeviceKey,
+    pub(crate) cookie_counter: AtomicU64,
+    pub(crate) pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
+    pub(crate) service_handlers: Arc<DashMap<BinderUintptrT, HandlerEntry>>,
+    pub(crate) writer_task: JoinHandle<()>,
+    pub(crate) service_tasks: Vec<JoinHandle<()>>,
 }
 
 impl BinderDevice {
@@ -451,8 +452,11 @@ impl BinderDevice {
         }
     }
 
-    /// Register a service handler for incoming transactions.
-    pub fn register_service<F, Fut>(self: &Arc<Self>, handler: F) -> ServiceRegistration
+    /// Register a handler for incoming transactions and return a binder object.
+    ///
+    /// When the returned `BinderObject` is dropped, the handler is automatically
+    /// unregistered from the device (RAII pattern).
+    pub fn register_object<F, Fut>(self: &Arc<Self>, handler: F) -> BinderObject
     where
         F: Fn(Transaction) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Payload> + Send + 'static,
@@ -476,7 +480,7 @@ impl BinderDevice {
 
         self.service_handlers.insert(cookie, entry);
 
-        ServiceRegistration { cookie }
+        BinderObject::new(self, cookie)
     }
 
     /// Send a two-way transaction and wait for reply.
@@ -584,18 +588,6 @@ mod WriterState {
 
     pub fn get() -> Option<mpsc::Sender<WriterMessage>> {
         THREAD_WRITER_STATE.with_borrow(|cell| cell.as_ref().cloned())
-    }
-}
-
-/// Registration handle for a service handler.
-pub struct ServiceRegistration {
-    pub cookie: BinderUintptrT,
-}
-
-impl ServiceRegistration {
-    /// Get the cookie for this registration.
-    pub fn cookie(&self) -> BinderUintptrT {
-        self.cookie
     }
 }
 
