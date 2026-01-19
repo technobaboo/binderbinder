@@ -384,6 +384,22 @@ impl TransactionData {
 
         (reply_data, objects)
     }
+
+    /// Serialize flat_binder_objects to bytes for transmission.
+    pub fn serialize_objects(objects: &[flat_binder_object]) -> Vec<u8> {
+        let mut result =
+            Vec::with_capacity(objects.len() * std::mem::size_of::<flat_binder_object>());
+        for obj in objects {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    obj as *const flat_binder_object as *const u8,
+                    std::mem::size_of::<flat_binder_object>(),
+                )
+            };
+            result.extend_from_slice(bytes);
+        }
+        result
+    }
 }
 
 pub struct FlatBinderObjectBuilder {

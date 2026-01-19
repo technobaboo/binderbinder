@@ -19,8 +19,8 @@ use crate::binder_thread::{self, DeviceKey};
 use crate::error::{Error, Result};
 use crate::object::BinderObject;
 use crate::sys::{
-    binder_transaction_data, binder_write_read, BinderSizeT, BinderUintptrT, BC_REPLY,
-    BC_TRANSACTION, BR_REPLY, BR_TRANSACTION, TF_ONE_WAY,
+    binder_transaction_data, binder_write_read, flat_binder_object, BinderSizeT, BinderUintptrT,
+    BC_REPLY, BC_TRANSACTION, BR_REPLY, BR_TRANSACTION, TF_ONE_WAY,
 };
 use crate::transaction::{Payload, Transaction, TransactionData};
 use dashmap::DashMap;
@@ -99,12 +99,12 @@ impl BinderDevice {
             tokio::select! {
                 msg = writer_rx.recv() => {
                     match msg {
-                        Some(WriterMessage::Transact { target, code, payload, cookie, reply_tx }) => {
-                            Self::send_transaction(&async_fd, target, code, &payload, cookie).await;
+                        Some(WriterMessage::Transact { target, code, payload, objects, cookie, reply_tx }) => {
+                            Self::send_transaction(&async_fd, target, code, &payload, &objects, cookie).await;
                             pending_replies.insert(cookie, reply_tx);
                         }
-                        Some(WriterMessage::TransactOneWay { target, code, payload }) => {
-                            Self::send_transaction_one_way(&async_fd, target, code, &payload).await;
+                        Some(WriterMessage::TransactOneWay { target, code, payload, objects }) => {
+                            Self::send_transaction_one_way(&async_fd, target, code, &payload, &objects).await;
                         }
                         None => {
                             break;
@@ -216,7 +216,7 @@ impl BinderDevice {
                         };
                         // Call handler asynchronously and send reply
                         let reply = handler_entry.handle(transaction).await;
-                        Self::send_reply(async_fd, &reply.data).await;
+                        Self::send_reply(async_fd, &reply.data, &[]).await;
                     } else {
                         eprintln!("No handler registered for cookie=0x{:x}", cookie);
                     }
@@ -342,16 +342,20 @@ impl BinderDevice {
         target: BinderRef,
         code: u32,
         payload: &[u8],
+        objects: &[flat_binder_object],
         _cookie: BinderUintptrT,
     ) {
         let fd = async_fd.get_ref().as_fd();
 
         let tx_data = TransactionData::new(target, code, 0);
-        let (data, _objects) = tx_data.with_payload(payload).build();
+        let (data, _existing_objects) = tx_data.with_payload(payload).build();
 
-        let mut write_buf = Vec::with_capacity(4 + data.len());
+        let objects_bytes = TransactionData::serialize_objects(objects);
+
+        let mut write_buf = Vec::with_capacity(4 + data.len() + objects_bytes.len());
         write_buf.extend_from_slice(&BC_TRANSACTION.to_le_bytes());
         write_buf.extend_from_slice(&data);
+        write_buf.extend_from_slice(&objects_bytes);
 
         let wr = binder_write_read {
             write_size: write_buf.len() as BinderSizeT,
@@ -374,15 +378,19 @@ impl BinderDevice {
         target: BinderRef,
         code: u32,
         payload: &[u8],
+        objects: &[flat_binder_object],
     ) {
         let fd = async_fd.get_ref().as_fd();
 
         let tx_data = TransactionData::new(target, code, TF_ONE_WAY);
-        let (data, _objects) = tx_data.with_payload(payload).build();
+        let (data, _existing_objects) = tx_data.with_payload(payload).build();
 
-        let mut write_buf = Vec::with_capacity(4 + data.len());
+        let objects_bytes = TransactionData::serialize_objects(objects);
+
+        let mut write_buf = Vec::with_capacity(4 + data.len() + objects_bytes.len());
         write_buf.extend_from_slice(&BC_TRANSACTION.to_le_bytes());
         write_buf.extend_from_slice(&data);
+        write_buf.extend_from_slice(&objects_bytes);
 
         let wr = binder_write_read {
             write_size: write_buf.len() as BinderSizeT,
@@ -400,15 +408,18 @@ impl BinderDevice {
     }
 
     /// Send a BC_REPLY with the given payload.
-    async fn send_reply(async_fd: &AsyncFd<OwnedFd>, data: &[u8]) {
+    async fn send_reply(async_fd: &AsyncFd<OwnedFd>, data: &[u8], objects: &[flat_binder_object]) {
         let fd = async_fd.get_ref().as_fd();
 
         let tx_data = TransactionData::new(BinderRef(0), 0, 0);
-        let (reply_data, _objects) = tx_data.with_payload(data).build();
+        let (reply_data, _existing_objects) = tx_data.with_payload(data).build();
 
-        let mut write_buf = Vec::with_capacity(4 + reply_data.len());
+        let objects_bytes = TransactionData::serialize_objects(objects);
+
+        let mut write_buf = Vec::with_capacity(4 + reply_data.len() + objects_bytes.len());
         write_buf.extend_from_slice(&BC_REPLY.to_le_bytes());
         write_buf.extend_from_slice(&reply_data);
+        write_buf.extend_from_slice(&objects_bytes);
 
         let wr = binder_write_read {
             write_size: write_buf.len() as BinderSizeT,
@@ -445,6 +456,17 @@ impl BinderDevice {
 
     /// Send a two-way transaction and wait for reply.
     pub async fn transact(&self, target: BinderRef, code: u32, data: &[u8]) -> Result<Payload> {
+        self.transact_with_objects(target, code, data, &[]).await
+    }
+
+    /// Send a two-way transaction with binder objects and wait for reply.
+    pub async fn transact_with_objects(
+        &self,
+        target: BinderRef,
+        code: u32,
+        data: &[u8],
+        objects: &[flat_binder_object],
+    ) -> Result<Payload> {
         let cookie = self.cookie_counter.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -455,6 +477,7 @@ impl BinderDevice {
                 target,
                 code,
                 payload,
+                objects: objects.to_vec(),
                 cookie,
                 reply_tx,
             })
@@ -466,12 +489,24 @@ impl BinderDevice {
 
     /// Send a one-way transaction (fire-and-forget).
     pub fn transact_one_way(&self, target: BinderRef, code: u32, data: &[u8]) -> Result<()> {
+        self.transact_one_way_with_objects(target, code, data, &[])
+    }
+
+    /// Send a one-way transaction with binder objects (fire-and-forget).
+    pub fn transact_one_way_with_objects(
+        &self,
+        target: BinderRef,
+        code: u32,
+        data: &[u8],
+        objects: &[flat_binder_object],
+    ) -> Result<()> {
         let payload = data.to_vec();
         self.writer_tx
             .try_send(WriterMessage::TransactOneWay {
                 target,
                 code,
                 payload,
+                objects: objects.to_vec(),
             })
             .map_err(|_| Error::Shutdown)
     }
@@ -492,6 +527,7 @@ pub(crate) enum WriterMessage {
         target: BinderRef,
         code: u32,
         payload: Vec<u8>,
+        objects: Vec<flat_binder_object>,
         cookie: BinderUintptrT,
         reply_tx: PendingReply,
     },
@@ -499,6 +535,7 @@ pub(crate) enum WriterMessage {
         target: BinderRef,
         code: u32,
         payload: Vec<u8>,
+        objects: Vec<flat_binder_object>,
     },
 }
 
