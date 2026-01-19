@@ -3,28 +3,20 @@
 //! When a BinderObject is dropped, the associated handler is automatically
 //! unregistered from the device (RAII pattern).
 
-use crate::sys::BinderUintptrT;
-use std::sync::Weak;
+use crate::{device::TransactionHandler, sys::BinderUintptrT};
+use std::sync::{Arc, Weak};
 
 use super::device::BinderDevice;
 
 /// A binder object that represents a registered service handler.
 ///
 /// When dropped, the handler is automatically unregistered from the device.
-pub struct BinderObject {
-    device: Weak<BinderDevice>,
+pub struct BinderObject<T: TransactionHandler> {
+    pub(crate) device: Weak<BinderDevice>,
+    pub handler: Arc<T>,
     pub cookie: BinderUintptrT,
 }
-
-impl BinderObject {
-    /// Create a new binder object.
-    pub(crate) fn new(device: &std::sync::Arc<BinderDevice>, cookie: BinderUintptrT) -> Self {
-        Self {
-            device: std::sync::Arc::downgrade(device),
-            cookie,
-        }
-    }
-
+impl<T: TransactionHandler> BinderObject<T> {
     /// Get the cookie for this object.
     pub fn cookie(&self) -> BinderUintptrT {
         self.cookie
@@ -35,8 +27,7 @@ impl BinderObject {
         self.device.strong_count() > 0
     }
 }
-
-impl Drop for BinderObject {
+impl<T: TransactionHandler> Drop for BinderObject<T> {
     fn drop(&mut self) {
         if let Some(device) = self.device.upgrade() {
             device.service_handlers.remove(&self.cookie);
