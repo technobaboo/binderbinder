@@ -1,19 +1,24 @@
-use binderbinder::{BinderDevice, BinderRef, Payload};
-
-extern crate libc;
+use binderbinder::{BinderDevice, BinderRef, Payload, Transaction, TransactionHandler};
 
 const ECHO_CODE: u32 = 1;
+
+pub struct BinderObject;
+impl TransactionHandler for BinderObject {
+    async fn handle(&self, transaction: Transaction) -> Payload {
+        transaction.payload
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Opening binder device...");
     let file = std::fs::File::open("/dev/binderfs/testbinder")?;
 
-    let device = BinderDevice::open(file).await?;
+    let device = BinderDevice::new(file);
     eprintln!("Binder opened");
 
     eprintln!("Setting context manager...");
-    let obj = device.register_object();
+    let obj = device.register_object(BinderObject);
     let _cm_ref = device.set_context_manager(obj).await?;
     eprintln!("Context manager set!");
 

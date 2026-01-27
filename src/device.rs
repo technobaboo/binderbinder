@@ -6,7 +6,7 @@
 //! - Arc<BinderDevice> shared across all tasks
 //! - DashMap for thread-safe pending_replies and service_handlers
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -20,36 +20,32 @@ use crate::error::{Error, Result};
 use crate::object::BinderObject;
 use crate::sys::{
     binder_transaction_data, binder_write_read, flat_binder_object, BinderSizeT, BinderUintptrT,
-    BC_REPLY, BC_TRANSACTION, BR_REPLY, BR_TRANSACTION, TF_ONE_WAY,
+    SetContextMGR, BC_REPLY, BC_TRANSACTION, BR_REPLY, BR_TRANSACTION, TF_ONE_WAY,
 };
 use crate::transaction::{Payload, Transaction, TransactionData};
 use dashmap::DashMap;
-use rustix::fd::FromRawFd;
 
 /// Shared binder device state.
 pub struct BinderDevice {
-    pub(crate) source_fd: RawFd,
-    pub(crate) device_key: DeviceKey,
     pub(crate) cookie_counter: AtomicU64,
     pub(crate) writer_tx: mpsc::Sender<WriterMessage>,
-    pub(crate) pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
-    pub(crate) service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn TransactionHandler>>>,
+    pub(crate) service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
     pub(crate) writer_task: JoinHandle<()>,
     pub(crate) service_tasks: Vec<JoinHandle<()>>,
 }
 
 impl BinderDevice {
     /// Create a new BinderDevice from an already-open fd.
-    pub fn new(fd: RawFd) -> Arc<Self> {
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let device_key = DeviceKey(fd);
+    pub fn new(fd: impl Into<OwnedFd>) -> Arc<Self> {
+        let fd = fd.into();
+        let device_key = DeviceKey(fd.as_raw_fd());
 
         let pending_replies = Arc::new(DashMap::new());
         let service_handlers = Arc::new(DashMap::new());
 
         let (writer_tx, writer_rx) = mpsc::channel(64);
         let writer_task = tokio::task::spawn(Self::spawn_writer_task(
-            owned_fd,
+            fd,
             writer_rx,
             Arc::clone(&pending_replies),
             Arc::clone(&service_handlers),
@@ -67,11 +63,8 @@ impl BinderDevice {
             .collect();
 
         let device = Self {
-            source_fd: fd,
-            device_key,
             writer_tx,
             cookie_counter: AtomicU64::new(1),
-            pending_replies,
             service_handlers,
             writer_task,
             service_tasks,
@@ -85,7 +78,7 @@ impl BinderDevice {
         fd: OwnedFd,
         mut writer_rx: mpsc::Receiver<WriterMessage>,
         pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
-        _service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn TransactionHandler>>>,
+        _service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
     ) {
         let async_fd = match AsyncFd::new(fd) {
             Ok(fd) => fd,
@@ -106,6 +99,9 @@ impl BinderDevice {
                         Some(WriterMessage::TransactOneWay { target, code, payload, objects }) => {
                             Self::send_transaction_one_way(&async_fd, target, code, &payload, &objects).await;
                         }
+                        Some(WriterMessage::SetContextManager { cookie }) => {
+                            Self::_set_context_manager(&async_fd, cookie).await;
+                        }
                         None => {
                             break;
                         }
@@ -122,7 +118,7 @@ impl BinderDevice {
     async fn service_task(
         device_key: DeviceKey,
         pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
-        service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn TransactionHandler>>>,
+        service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
     ) {
         if let Err(e) = binder_thread::ensure_device_ready(device_key.0) {
             eprintln!(
@@ -203,7 +199,7 @@ impl BinderDevice {
         cmd: u32,
         async_fd: &AsyncFd<OwnedFd>,
         pending_replies: Arc<DashMap<BinderUintptrT, PendingReply>>,
-        service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn TransactionHandler>>>,
+        service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
     ) {
         match cmd {
             BR_TRANSACTION => {
@@ -407,6 +403,17 @@ impl BinderDevice {
         }
     }
 
+    async fn _set_context_manager(async_fd: &AsyncFd<OwnedFd>, _cookie: BinderUintptrT) {
+        let fd = async_fd.get_ref().as_fd();
+
+        let buf = SetContextMGR(flat_binder_object);
+
+        let res = unsafe { rustix::ioctl::ioctl(fd, buf) };
+        if let Err(e) = res {
+            eprintln!("send_transaction_one_way error: {:?}", e);
+        }
+    }
+
     /// Send a BC_REPLY with the given payload.
     async fn send_reply(async_fd: &AsyncFd<OwnedFd>, data: &[u8], objects: &[flat_binder_object]) {
         let fd = async_fd.get_ref().as_fd();
@@ -434,6 +441,17 @@ impl BinderDevice {
         if let Err(e) = res {
             eprintln!("send_reply error: {:?}", e);
         }
+    }
+
+    pub async fn set_context_manager<T: TransactionHandler>(
+        &self,
+        handler: &BinderObject<T>,
+    ) -> Result<()> {
+        self.writer_tx
+            .try_send(WriterMessage::SetContextManager {
+                cookie: handler.cookie,
+            })
+            .map_err(|_| Error::ChannelFull)
     }
 
     /// Register a handler for incoming transactions and return a binder object.
@@ -537,12 +555,29 @@ pub(crate) enum WriterMessage {
         payload: Vec<u8>,
         objects: Vec<flat_binder_object>,
     },
+    SetContextManager {
+        cookie: u64,
+    },
 }
 
 /// Pending reply for a two-way transaction.
 type PendingReply = oneshot::Sender<Result<Payload>>;
 
 #[async_trait::async_trait]
-pub trait TransactionHandler: Send + Sync + 'static {
+pub(crate) trait DynTransactionHandler: Send + Sync + 'static {
     async fn handle(&self, transaction: Transaction) -> Payload;
+}
+
+pub trait TransactionHandler: Send + Sync + 'static {
+    fn handle(
+        &self,
+        transaction: Transaction,
+    ) -> impl std::future::Future<Output = Payload> + std::marker::Send;
+}
+
+#[async_trait::async_trait]
+impl<T: TransactionHandler> DynTransactionHandler for T {
+    async fn handle(&self, transaction: Transaction) -> Payload {
+        <Self as TransactionHandler>::handle(&self, transaction).await
+    }
 }

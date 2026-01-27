@@ -387,8 +387,7 @@ impl TransactionData {
 
     /// Serialize flat_binder_objects to bytes for transmission.
     pub fn serialize_objects(objects: &[flat_binder_object]) -> Vec<u8> {
-        let mut result =
-            Vec::with_capacity(objects.len() * std::mem::size_of::<flat_binder_object>());
+        let mut result = Vec::with_capacity(std::mem::size_of_val(objects));
         for obj in objects {
             let bytes = unsafe {
                 std::slice::from_raw_parts(

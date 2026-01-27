@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match unsafe { libc::fork() } {
         -1 => panic!("fork failed"),
         0 => {
-            let device = BinderDevice::open(file).await?;
+            let device = BinderDevice::new(file);
             eprintln!("Parent: device created (sync mode)");
 
             eprintln!("Parent: waiting 500ms for parent to be ready...");
