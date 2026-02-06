@@ -1,4 +1,4 @@
-use crate::sys::binderfs_device;
+use crate::sys::BinderfsDevice;
 use std::os::unix::io::OwnedFd;
 
 pub const BINDERFS_DEV_MAJOR: u64 = 0;
@@ -59,7 +59,7 @@ impl Binderfs {
             ));
         }
 
-        let mut device = binderfs_device::default();
+        let mut device = BinderfsDevice::default();
 
         let name_bytes = name.as_bytes();
         device.name[..name_bytes.len()].copy_from_slice(name_bytes);

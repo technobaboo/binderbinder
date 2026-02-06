@@ -1,76 +1,132 @@
+use std::marker::PhantomData;
+
+use bitflags::bitflags;
 use rustix::ffi::c_void;
-use rustix::ioctl::Opcode;
+use rustix::ioctl::opcode::{none, read, write};
 use rustix::ioctl::{opcode::read_write, Ioctl};
+use rustix::process::{RawPid, RawUid};
 
 pub type BinderSizeT = u64;
 pub type BinderUintptrT = u64;
 
-pub const BINDER_TYPE_BINDER: u32 = 0x17;
-pub const BINDER_TYPE_WEAK_BINDER: u32 = 0x18;
-pub const BINDER_TYPE_HANDLE: u32 = 0x19;
-pub const BINDER_TYPE_WEAK_HANDLE: u32 = 0x1a;
-pub const BINDER_TYPE_FD: u32 = 0x1b;
-pub const BINDER_TYPE_FDA: u32 = 0x1c;
-pub const BINDER_TYPE_PTR: u32 = 0x1d;
+/// TODO: value names in debug impl
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct BinderType(u32);
+impl BinderType {
+    pub const BINDER: Self = Self(0x17);
+    pub const WEAK_BINDER: Self = Self(0x18);
+    pub const HANDLE: Self = Self(0x19);
+    pub const WEAK_HANDLE: Self = Self(0x1a);
+    pub const FD: Self = Self(0x1b);
+    /// Fd array
+    pub const FDA: Self = Self(0x1c);
+    pub const PTR: Self = Self(0x1d);
+}
 
-pub const FLAT_BINDER_FLAG_PRIORITY_MASK: u32 = 0xff;
-pub const FLAT_BINDER_FLAG_ACCEPTS_FDS: u32 = 0x100;
-pub const FLAT_BINDER_FLAG_TXN_SECURITY_CTX: u32 = 0x1000;
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct FlatBinderFlags: u32 {
+        const PRIORITY_MASK = 0xff;
+        const ACCEPTS_FDS = 0x100;
+        const SECURITY_CTX = 0x1000;
+        const _ = !0;
+    }
+}
 
-pub const BINDER_BUFFER_FLAG_HAS_PARENT: u32 = 0x01;
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct BinderBufferFlags: u32 {
+        const HAS_PARENT= 0x01;
+        const _ = !0;
+    }
+}
 
 pub const BINDER_CURRENT_PROTOCOL_VERSION: u32 = 8;
 
-pub const TF_ONE_WAY: u32 = 0x01;
-pub const TF_ROOT_OBJECT: u32 = 0x04;
-pub const TF_STATUS_CODE: u32 = 0x08;
-pub const TF_ACCEPT_FDS: u32 = 0x10;
-pub const TF_CLEAR_BUF: u32 = 0x20;
-pub const TF_UPDATE_TXN: u32 = 0x40;
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct TransactionFlags: u32 {
+        const ONE_WAY = 0x01;
+        const ROOT_OBJECT = 0x04;
+        const STATUS_CODE = 0x08;
+        const ACCEPT_FDS = 0x10;
+        const CLEAR_BUF = 0x20;
+        const UPDATE_TXN = 0x40;
+        const _ = !0;
+    }
+}
 
-pub const BC_TRANSACTION: u32 = 0xc0306200;
-pub const BC_REPLY: u32 = 0xc0306201;
-pub const BC_ACQUIRE_RESULT: u32 = 0xc0306202;
-pub const BC_FREE_BUFFER: u32 = 0xc0306300;
-pub const BC_INCREFS: u32 = 0xc0306404;
-pub const BC_ACQUIRE: u32 = 0xc0306405;
-pub const BC_RELEASE: u32 = 0xc0306406;
-pub const BC_DECREFS: u32 = 0xc0306407;
-pub const BC_INCREFS_DONE: u32 = 0xc0306508;
-pub const BC_ACQUIRE_DONE: u32 = 0xc0306509;
-pub const BC_ATTEMPT_ACQUIRE: u32 = 0xc030650a;
-pub const BC_REGISTER_LOOPER: u32 = 0xc030660b;
-pub const BC_ENTER_LOOPER: u32 = 0xc030660c;
-pub const BC_EXIT_LOOPER: u32 = 0xc030660d;
-pub const BC_REQUEST_DEATH_NOTIFICATION: u32 = 0xc030670e;
-pub const BC_CLEAR_DEATH_NOTIFICATION: u32 = 0xc030670f;
-pub const BC_DEAD_BINDER_DONE: u32 = 0xc0306810;
-pub const BC_TRANSACTION_SG: u32 = 0xc0306213;
-pub const BC_REPLY_SG: u32 = 0xc0306214;
+/// TODO: value names in debug impl
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct BinderCommand(u32);
+impl BinderCommand {
+    pub const TRANSACTION: Self = Self(write::<BinderTransactionData>(b'c', 0));
+    pub const REPLY: Self = Self(write::<BinderTransactionData>(b'c', 1));
+    pub const ACQUIRE_RESULT: Self = Self(write::<i32>(b'c', 2));
+    pub const FREE_BUFFER: Self = Self(write::<BinderUintptrT>(b'c', 3));
+    pub const INCREFS: Self = Self(write::<u32>(b'c', 4));
+    pub const ACQUIRE: Self = Self(write::<u32>(b'c', 5));
+    pub const RELEASE: Self = Self(write::<u32>(b'c', 6));
+    pub const DECREFS: Self = Self(write::<u32>(b'c', 7));
+    pub const INCREFS_DONE: Self = Self(write::<BinderPtrCookie>(b'c', 8));
+    pub const ACQUIRE_DONE: Self = Self(write::<BinderPtrCookie>(b'c', 9));
+    pub const ATTEMPT_ACQUIRE: Self = Self(write::<BinderPriorityDesc>(b'c', 10));
+    pub const REGISTER_LOOPER: Self = Self(none(b'c', 11));
+    pub const ENTER_LOOPER: Self = Self(none(b'c', 12));
+    pub const EXIT_LOOPER: Self = Self(none(b'c', 13));
+    pub const REQUEST_DEATH_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 14));
+    pub const CLEAR_DEATH_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 15));
+    pub const DEAD_BINDER_DONE: Self = Self(write::<BinderUintptrT>(b'c', 16));
+    pub const TRANSACTION_SG: Self = Self(write::<BinderTransactionDataSg>(b'c', 17));
+    pub const REPLY_SG: Self = Self(write::<BinderTransactionDataSg>(b'c', 18));
+    pub const REQUEST_FREEZE_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 19));
+    pub const CLEAR_FREEZE_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 20));
+    pub const FREEZE_NOTIFICATION_DONE: Self = Self(write::<BinderUintptrT>(b'c', 21));
 
-pub const BR_ERROR: u32 = 0x72080000;
-pub const BR_OK: u32 = 0x72080001;
-pub const BR_TRANSACTION: u32 = 0x72080002;
-pub const BR_REPLY: u32 = 0x72080003;
-pub const BR_ACQUIRE_RESULT: u32 = 0x72080004;
-pub const BR_DEAD_REPLY: u32 = 0x72080005;
-pub const BR_TRANSACTION_COMPLETE: u32 = 0x72080006;
-pub const BR_INCREFS: u32 = 0x72080007;
-pub const BR_ACQUIRE: u32 = 0x72080008;
-pub const BR_RELEASE: u32 = 0x72080009;
-pub const BR_DECREFS: u32 = 0x7208000a;
-pub const BR_ATTEMPT_ACQUIRE: u32 = 0x7208000b;
-pub const BR_NOOP: u32 = 0x7208000c;
-pub const BR_SPAWN_LOOPER: u32 = 0x7208000d;
-pub const BR_FINISHED: u32 = 0x7208000e;
-pub const BR_DEAD_BINDER: u32 = 0x7208000f;
-pub const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = 0x72080010;
-pub const BR_FAILED_REPLY: u32 = 0x72080011;
-pub const BR_FROZEN_REPLY: u32 = 0x72080012;
-pub const BR_ONEWAY_SPAM_SUSPECT: u32 = 0x72080013;
-pub const BR_TRANSACTION_PENDING_FROZEN: u32 = 0x72080014;
-pub const BR_FROZEN_BINDER: u32 = 0x72080015;
-pub const BR_CLEAR_FREEZE_NOTIFICATION_DONE: u32 = 0x72080016;
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+/// TODO: value names in debug impl
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct BinderReturn(u32);
+impl BinderReturn {
+    pub const ERROR: Self = Self(read::<i32>(b'r', 0));
+    pub const OK: Self = Self(none(b'r', 1));
+    pub const TRANSACTION_SEC_CTX: Self = Self(read::<BinderTransactionDataSecCtx>(b'r', 2));
+    pub const TRANSACTION: Self = Self(read::<BinderTransactionData>(b'r', 2));
+    pub const REPLY: Self = Self(read::<BinderTransactionData>(b'r', 3));
+    pub const ACQUIRE_RESULT: Self = Self(read::<i32>(b'r', 4));
+    pub const DEAD_REPLY: Self = Self(none(b'r', 5));
+    pub const TRANSACTION_COMPLETE: Self = Self(none(b'r', 6));
+    pub const INCREFS: Self = Self(read::<BinderPtrCookie>(b'r', 7));
+    pub const ACQUIRE: Self = Self(read::<BinderPtrCookie>(b'r', 8));
+    pub const RELEASE: Self = Self(read::<BinderPtrCookie>(b'r', 9));
+    pub const DECREFS: Self = Self(read::<BinderPtrCookie>(b'r', 10));
+    pub const ATTEMPT_ACQUIRE: Self = Self(read::<BinderPriorityPtrCookie>(b'r', 11));
+    pub const NOOP: Self = Self(none(b'r', 12));
+    pub const SPAWN_LOOPER: Self = Self(none(b'r', 13));
+    pub const FINISHED: Self = Self(none(b'r', 14));
+    pub const DEAD_BINDER: Self = Self(read::<BinderUintptrT>(b'r', 15));
+    pub const CLEAR_DEATH_NOTIFICATION_DONE: Self = Self(read::<BinderUintptrT>(b'r', 16));
+    pub const FAILED_REPLY: Self = Self(none(b'r', 17));
+    pub const FROZEN_REPLY: Self = Self(none(b'r', 18));
+    pub const ONEWAY_SPAM_SUSPECT: Self = Self(none(b'r', 19));
+    pub const TRANSACTION_PENDING_FROZEN: Self = Self(none(b'r', 20));
+    pub const FROZEN_BINDER: Self = Self(read::<BinderFrozenStateInfo>(b'r', 21));
+    pub const CLEAR_FREEZE_NOTIFICATION_DONE: Self = Self(read::<BinderUintptrT>(b'r', 22));
+
+    pub fn from_u32(v: u32) -> Self {
+        Self(v)
+    }
+}
 
 pub const BINDER_VERSION: u32 = 0x40046209;
 pub const BINDER_SET_CONTEXT_MGR: u32 = 0x40046207;
@@ -78,24 +134,56 @@ pub const BINDER_SET_MAX_THREADS: u32 = 0x4004620c;
 pub const BINDER_WRITE_READ: u32 = 0xc0306201;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct binder_object_header {
-    pub type_: u32,
+#[derive(Debug, Clone, Copy)]
+pub struct BinderObjectHeader {
+    pub type_: BinderType,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct flat_binder_object {
-    pub hdr: binder_object_header,
-    pub flags: u32,
+#[derive(Clone, Copy)]
+pub union FlatBinderObjectData {
     pub binder: BinderUintptrT,
+    pub handle: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlatBinderObject<'a> {
+    pub hdr: BinderObjectHeader,
+    pub flags: FlatBinderFlags,
+    /// in the uapi this is flattened
+    pub data: FlatBinderObjectData,
     pub cookie: BinderUintptrT,
+    pub _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> std::fmt::Debug for FlatBinderObject<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlatBinderObject")
+            .field("hdr", &self.hdr)
+            .field("flags", &self.flags)
+            .field(
+                "data",
+                match self.hdr.type_ {
+                    // TODO: figure out if this is even correct, lol
+                    BinderType::BINDER
+                    | BinderType::FD
+                    | BinderType::WEAK_BINDER
+                    | BinderType::FDA
+                    | BinderType::PTR => unsafe { &self.data.binder },
+                    BinderType::HANDLE | BinderType::WEAK_HANDLE => unsafe { &self.data.handle },
+                    _ => &"unknown",
+                },
+            )
+            .field("cookie", &self.cookie)
+            .finish()
+    }
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_fd_object {
-    pub hdr: binder_object_header,
+pub struct BinderFdObject {
+    pub hdr: BinderObjectHeader,
     pub pad_flags: u32,
     pub pad_binder: BinderUintptrT,
     pub fd: u32,
@@ -104,9 +192,9 @@ pub struct binder_fd_object {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_buffer_object {
-    pub hdr: binder_object_header,
-    pub flags: u32,
+pub struct BinderBufferObject {
+    pub hdr: BinderObjectHeader,
+    pub flags: BinderBufferFlags,
     pub buffer: BinderUintptrT,
     pub length: BinderSizeT,
     pub parent: BinderSizeT,
@@ -115,9 +203,9 @@ pub struct binder_buffer_object {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_fd_array_object {
-    pub hdr: binder_object_header,
-    pub pad: u32,
+pub struct BinderFdArrayObject {
+    pub hdr: BinderObjectHeader,
+    pub _pad: u32,
     pub num_fds: BinderSizeT,
     pub parent: BinderSizeT,
     pub parent_offset: BinderSizeT,
@@ -125,7 +213,7 @@ pub struct binder_fd_array_object {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct binder_write_read {
+pub struct BinderWriteRead {
     pub write_size: BinderSizeT,
     pub write_consumed: BinderSizeT,
     pub write_buffer: BinderUintptrT,
@@ -136,75 +224,100 @@ pub struct binder_write_read {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_version {
+pub struct BinderVersion {
     pub protocol_version: i32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_transaction_data_ptrs {
+pub struct BinderTransactionDataPtrs {
     pub buffer: BinderUintptrT,
     pub offsets: BinderUintptrT,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct binder_transaction_data {
-    pub target: BinderUintptrT,
-    pub cookie: BinderUintptrT,
-    pub code: u32,
-    pub flags: u32,
-    pub sender_pid: i32,
-    pub sender_euid: i32,
-    pub data_size: BinderSizeT,
-    pub offsets_size: BinderSizeT,
-    pub data: binder_transaction_data_ptrs,
+#[derive(Clone, Copy)]
+pub union TransactionTarget {
+    pub binder: BinderUintptrT,
+    pub handle: u32,
 }
 
-impl Default for binder_transaction_data {
-    fn default() -> Self {
-        binder_transaction_data {
-            target: 0,
-            cookie: 0,
-            code: 0,
-            flags: 0,
-            sender_pid: 0,
-            sender_euid: 0,
-            data_size: 0,
-            offsets_size: 0,
-            data: binder_transaction_data_ptrs {
-                buffer: 0,
-                offsets: 0,
-            },
-        }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BinderTransactionData {
+    pub target: TransactionTarget,
+    pub cookie: BinderUintptrT,
+    pub code: u32,
+    pub flags: TransactionFlags,
+    pub sender_pid: RawPid,
+    pub sender_euid: RawUid,
+    pub data_size: BinderSizeT,
+    pub offsets_size: BinderSizeT,
+    pub data: BinderTransactionDataPtrs,
+}
+
+impl std::fmt::Debug for BinderTransactionData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderTransactionData")
+            .field("cookie", &self.cookie)
+            .field("code", &self.code)
+            .field("flags", &self.flags)
+            .field("sender_pid", &self.sender_pid)
+            .field("sender_euid", &self.sender_euid)
+            .field("data_size", &self.data_size)
+            .field("offsets_size", &self.offsets_size)
+            .field("data", &self.data)
+            .finish()
     }
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_ptr_cookie {
+pub struct BinderTransactionDataSecCtx {
+    pub transaction_data: BinderTransactionData,
+    pub sec_ctx: BinderUintptrT,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderTransactionDataSg {
+    pub transaction_data: BinderTransactionData,
+    pub buffer_size: BinderSizeT,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderPtrCookie {
     pub ptr: BinderUintptrT,
     pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binder_handle_cookie {
+pub struct BinderPriorityPtrCookie {
+    pub priority: i32,
+    pub ptr: BinderUintptrT,
+    pub cookie: BinderUintptrT,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderHandleCookie {
     pub handle: u32,
     pub cookie: BinderUintptrT,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct binderfs_device {
+pub struct BinderfsDevice {
     pub name: [u8; 256],
     pub major: u32,
     pub minor: u32,
 }
 
-impl Default for binderfs_device {
+impl Default for BinderfsDevice {
     fn default() -> Self {
-        binderfs_device {
+        BinderfsDevice {
             name: [0u8; 256],
             major: 0,
             minor: 0,
@@ -212,13 +325,28 @@ impl Default for binderfs_device {
     }
 }
 
-unsafe impl Ioctl for binder_version {
-    type Output = binder_version;
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderFrozenStateInfo {
+    pub cookie: BinderUintptrT,
+    pub is_frozen: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderPriorityDesc {
+    priority: i32,
+    desc: u32,
+}
+
+unsafe impl Ioctl for BinderVersion {
+    type Output = BinderVersion;
 
     const IS_MUTATING: bool = true;
 
     fn opcode(&self) -> rustix::ioctl::Opcode {
-        read_write::<binder_version>(b'b', 9)
+        read_write::<BinderVersion>(b'b', 9)
     }
 
     fn as_ptr(&mut self) -> *mut c_void {
@@ -233,7 +361,7 @@ unsafe impl Ioctl for binder_version {
     }
 }
 
-unsafe impl Ioctl for binder_write_read {
+unsafe impl Ioctl for &mut BinderWriteRead {
     type Output = ();
 
     const IS_MUTATING: bool = true;
@@ -254,7 +382,7 @@ unsafe impl Ioctl for binder_write_read {
     }
 }
 
-unsafe impl Ioctl for binderfs_device {
+unsafe impl Ioctl for BinderfsDevice {
     type Output = ();
 
     const IS_MUTATING: bool = true;
@@ -280,21 +408,30 @@ async fn test_version_ioctl() {
     let file = std::fs::File::open("/dev/binderfs/testbinder").expect(
         "Could not open /dev/binderfs/testbinder. Run: sudo ./target/debug/examples/new_device",
     );
-    let version = binder_version {
+    let version = BinderVersion {
         protocol_version: 0,
     };
     let result = unsafe { rustix::ioctl::ioctl(&file, version) };
     assert!(result.is_ok());
     assert_eq!(result.unwrap().protocol_version, 8);
 }
-pub struct SetContextMGR(pub flat_binder_object);
-unsafe impl Ioctl for SetContextMGR {
+#[test]
+pub const fn binder_type_niche() {
+    let a = size_of::<BinderType>();
+    let b = size_of::<Option<BinderType>>();
+    if a == b {
+        panic!("Binder Type has a niche");
+    }
+}
+#[repr(transparent)]
+pub struct SetContextMGR<'a>(pub FlatBinderObject<'a>);
+unsafe impl Ioctl for SetContextMGR<'_> {
     type Output = ();
 
     const IS_MUTATING: bool = true;
 
     fn opcode(&self) -> rustix::ioctl::Opcode {
-        rw_op::<Self>(BINDER_SET_CONTEXT_MGR as u8)
+        write::<Self>(b'b', 13)
     }
 
     fn as_ptr(&mut self) -> *mut rustix::ffi::c_void {
@@ -307,8 +444,4 @@ unsafe impl Ioctl for SetContextMGR {
     ) -> rustix::io::Result<Self::Output> {
         Ok(())
     }
-}
-
-const fn rw_op<T>(opcode: u8) -> Opcode {
-    read_write::<T>(b'b', opcode)
 }

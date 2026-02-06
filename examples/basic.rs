@@ -1,5 +1,5 @@
 use binderbinder::fs::Binderfs;
-use binderbinder::sys::binder_version;
+use binderbinder::sys::BinderVersion;
 
 fn main() {
     println!("binderbinder - Phase 1 Test");
@@ -40,7 +40,7 @@ fn main() {
 
     println!("[3] Calling BINDER_VERSION ioctl");
 
-    let version = binder_version {
+    let version = BinderVersion {
         protocol_version: 0,
     };
     let result = unsafe { rustix::ioctl::ioctl(&binder_fd, version) };

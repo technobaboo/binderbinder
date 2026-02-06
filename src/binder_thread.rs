@@ -11,7 +11,7 @@
 //! Multiple binder devices are supported, keyed by their source fd.
 
 use crate::sys::{
-    binder_write_read, BinderUintptrT, BC_EXIT_LOOPER, BC_REGISTER_LOOPER, BC_TRANSACTION,
+    BinderUintptrT, BinderWriteRead, BC_EXIT_LOOPER, BC_REGISTER_LOOPER, BC_TRANSACTION,
 };
 use rustix::fd::FromRawFd;
 use std::collections::HashMap;
@@ -20,8 +20,8 @@ use tokio::io::unix::AsyncFd;
 
 /// Keyed by the SOURCE fd (the fd passed to BinderDevice)
 /// Multiple devices can be registered per thread.
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
-pub struct DeviceKey(pub RawFd);
+#[derive(Debug)]
+pub struct DeviceKey(pub OwnedFd);
 
 /// Registration state for one device on one thread.
 /// Holds the duplicated fd wrapped in AsyncFd for async I/O.
@@ -182,7 +182,7 @@ fn read_binder_commands(fd: std::os::fd::BorrowedFd<'_>) -> Vec<u32> {
     let read_buf_size = 256 * 1024;
     let mut read_buf = vec![0u8; read_buf_size];
 
-    let wr = binder_write_read {
+    let wr = BinderWriteRead {
         write_size: 0,
         write_consumed: 0,
         write_buffer: 0,
@@ -250,12 +250,12 @@ fn handle_command(cmd: u32, async_fd: &AsyncFd<OwnedFd>, device_key: DeviceKey) 
 
 /// Parse a BR_TRANSACTION command to extract transaction data.
 fn parse_br_transaction(async_fd: &AsyncFd<OwnedFd>) -> Option<TransactionInfo> {
-    use crate::sys::binder_transaction_data;
+    use crate::sys::BinderTransactionData;
 
     let read_buf_size = 256 * 1024;
     let mut read_buf = vec![0u8; read_buf_size];
 
-    let wr = binder_write_read {
+    let wr = BinderWriteRead {
         write_size: 0,
         write_consumed: 0,
         write_buffer: 0,
@@ -271,7 +271,7 @@ fn parse_br_transaction(async_fd: &AsyncFd<OwnedFd>) -> Option<TransactionInfo> 
     }
 
     let data = &read_buf[..wr.read_consumed as usize];
-    if data.len() < std::mem::size_of::<binder_transaction_data>() {
+    if data.len() < std::mem::size_of::<BinderTransactionData>() {
         return None;
     }
 
@@ -283,7 +283,7 @@ fn parse_br_transaction(async_fd: &AsyncFd<OwnedFd>) -> Option<TransactionInfo> 
             .ok()?,
     );
 
-    let data_start = std::mem::size_of::<binder_transaction_data>();
+    let data_start = std::mem::size_of::<BinderTransactionData>();
     let offsets_start = data_start + data_size as usize;
 
     let payload_data = if data_size > 0 {
@@ -319,7 +319,7 @@ fn handle_transaction(tx: TransactionInfo, _async_fd: &AsyncFd<OwnedFd>, _device
 
 /// Send a single binder command (just the 4-byte command code).
 fn send_binder_command(fd: std::os::fd::BorrowedFd<'_>, cmd: u32) -> std::io::Result<()> {
-    let wr = binder_write_read {
+    let wr = BinderWriteRead {
         write_size: 4,
         write_consumed: 0,
         write_buffer: &cmd as *const u32 as BinderUintptrT,
@@ -347,7 +347,7 @@ pub async fn send_binder_write(async_fd: &AsyncFd<OwnedFd>, data: &[u8]) {
     write_buf.extend_from_slice(&cmd.to_le_bytes());
     write_buf.extend_from_slice(data);
 
-    let wr = binder_write_read {
+    let wr = BinderWriteRead {
         write_size: write_buf.len() as BinderUintptrT,
         write_consumed: 0,
         write_buffer: write_buf.as_ptr() as BinderUintptrT,
