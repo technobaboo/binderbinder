@@ -1,12 +1,10 @@
-use std::time::Duration;
-
 use binderbinder::{
     binder_ports::BinderPortHandle,
     device::Transaction,
     transaction_data::{BinderObjectType, PayloadBuilder},
-    BinderDevice, BinderRef, TransactionHandler,
+    BinderDevice, TransactionHandler,
 };
-use tokio::{task::spawn_blocking, time::sleep};
+use tokio::task::spawn_blocking;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -14,7 +12,7 @@ const ECHO_CODE: u32 = 1;
 
 pub struct BinderObject;
 impl TransactionHandler for BinderObject {
-    async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder {
+    async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {
         let mut builder = PayloadBuilder::new();
         if transaction.code != ECHO_CODE {
             builder.push_bytes(b"unknown transaction code");
@@ -53,7 +51,7 @@ impl TransactionHandler for BinderObject {
         builder
     }
 
-    async fn handle_one_way(&self, transaction: binderbinder::device::Transaction) {
+    async fn handle_one_way(&self, _transaction: binderbinder::device::Transaction) {
         info!("got oneway transaction")
     }
 }
@@ -67,11 +65,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let device = BinderDevice::new("/dev/binderfs/testbinder")?;
     info!("Binder opened");
-    sleep(Duration::from_secs(1)).await;
+
     info!("Setting context manager...");
     let obj = device.register_object(BinderObject);
     let _cm_ref = device.set_context_manager(&obj).await?;
     info!("Context manager set!");
+
+    info!("Sending echo transaction to self");
+    let transaction_future = spawn_blocking(move || {
+        let mut payload = PayloadBuilder::new();
+        payload.push_bytes(b"hello from self");
+        device.transact_blocking(
+            &BinderPortHandle::get_context_manager_handle(&device),
+            ECHO_CODE,
+            payload,
+        )
+    });
+    match transaction_future.await.unwrap() {
+        Ok((_, mut reply)) => {
+            info!(
+                "Received: {:?}",
+                String::from_utf8_lossy(&reply.read_bytes(reply.bytes_until_next_obj()).unwrap())
+            );
+        }
+        Err(e) => {
+            error!("Error: {:?}", e);
+        }
+    }
 
     tokio::signal::ctrl_c().await.unwrap();
     Ok(())

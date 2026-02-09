@@ -2,8 +2,13 @@ use std::fs::{remove_file, set_permissions};
 use std::os::unix::fs::PermissionsExt;
 
 use binderbinder::fs::Binderfs;
+use tracing::error;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--check") {
@@ -12,7 +17,7 @@ fn main() {
             println!("OK: testbinder exists at {}", path.display());
             std::process::exit(0);
         } else {
-            eprintln!("ERROR: testbinder not found");
+            error!("testbinder not found");
             std::process::exit(1);
         }
     }
@@ -21,7 +26,7 @@ fn main() {
     println!("==================================\n");
 
     if !is_root() {
-        eprintln!("ERROR: This must be run as root!");
+        error!("This must be run as root!");
         eprintln!("Run with: sudo ./target/debug/examples/new_device");
         std::process::exit(1);
     }

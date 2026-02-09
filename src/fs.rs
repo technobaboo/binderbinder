@@ -22,21 +22,21 @@ impl Binderfs {
         }
 
         if !path.is_dir() {
+            println!("hm");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotADirectory,
                 "binderfs path is not a directory",
             ));
         }
 
-        let mounts = std::fs::read_to_string("/proc/mounts")?;
-        if !mounts.contains("binder") {
-            std::process::Command::new("mount")
-                .arg("-t")
-                .arg("binder")
-                .arg("binder")
-                .arg(path)
-                .status()?;
-        }
+        // ideally we would check if the target dir is alread mounted as a binderfs but idk how to
+        // do that rn
+        std::process::Command::new("mount")
+            .arg("-t")
+            .arg("binder")
+            .arg("binder")
+            .arg(path)
+            .status()?;
 
         let control_fd = OwnedFd::from(
             std::fs::OpenOptions::new()
