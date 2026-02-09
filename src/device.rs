@@ -6,18 +6,23 @@
 //! - Arc<BinderDevice> shared across all tasks
 //! - DashMap for thread-safe pending_replies and service_handlers
 
+use core::slice;
+use rustix::fs::{Mode, OFlags};
 use rustix::io::{self};
-use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix;
 use std::path::Path;
-use std::process::id;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::{ptr, slice};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+use std::thread::sleep;
+use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
+use crate::binder_ports::{
+    BinderPort, BinderPortHandle, OwnedBinderPort, OwnedBinderPortId, WeakBinderPortHandle,
+};
 use crate::error::{Error, Result};
 use crate::object::BinderObject;
 use crate::sys::{
@@ -27,78 +32,63 @@ use crate::sys::{
     TransactionFlags, TransactionTarget,
 };
 use crate::transaction::{Payload, Transaction};
-use crate::BinderObjectEntry;
+use crate::transaction_data::{PayloadBuilder, PayloadReader};
 use dashmap::DashMap;
 
 /// Shared binder device state.
 pub struct BinderDevice {
     fd: Arc<OwnedFd>,
-    pub(crate) cookie_counter: AtomicU64,
+    pub(crate) cookie_counter: AtomicUsize,
     looper_threads: Vec<std::thread::JoinHandle<()>>,
-    exiting: Arc<AtomicBool>,
-    pub(crate) service_handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
+    pub(crate) owned_ports: Arc<DashMap<OwnedBinderPortId, Arc<OwnedBinderPort>>>,
+    pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderPortHandle>>>,
+    pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderPortHandle>>>,
 }
 
 impl BinderDevice {
-    pub fn new(path: impl AsRef<Path>) {}
+    pub fn new(path: impl AsRef<Path>) -> rustix::io::Result<Arc<Self>> {
+        let fd = rustix::fs::open(
+            path.as_ref(),
+            OFlags::CLOEXEC | OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        Ok(Self::from_fd(fd))
+    }
     /// Create a new BinderDevice from an already-open fd.
     pub fn from_fd(fd: impl Into<OwnedFd>) -> Arc<Self> {
         let fd = Arc::new(fd.into());
-        let handlers = Arc::new(DashMap::new());
-        let exiting = Arc::new(AtomicBool::new(false));
-        let loopers = (0..5)
-            .map(|_| {
-                std::thread::spawn({
-                    let handlers = handlers.clone();
-                    let runtime = tokio::runtime::Handle::current();
-                    let exiting = exiting.clone();
-                    let fd = fd.clone();
-                    move || {
-                        let _guard = runtime.enter();
-                        looper(handlers, &runtime, exiting, fd)
-                    }
+        let started = Arc::new(AtomicBool::new(false));
+        let dev = Arc::new_cyclic(|weak| {
+            let loopers = (0..5)
+                .map(|_| {
+                    std::thread::spawn({
+                        let runtime = tokio::runtime::Handle::current();
+                        let fd = fd.clone();
+                        let dev = weak.clone();
+                        let started = started.clone();
+                        move || {
+                            let _guard = runtime.enter();
+                            // we love busy waiting
+                            while !started.load(Ordering::Relaxed) {
+                                sleep(Duration::from_millis(1));
+                            }
+                            drop(started);
+                            looper(&runtime, dev, fd);
+                        }
+                    })
                 })
-            })
-            .collect();
-        let device = Self {
-            fd,
-            cookie_counter: AtomicU64::new(1),
-            looper_threads: loopers,
-            exiting,
-            service_handlers: handlers,
-        };
-
-        // let pending_replies = Arc::new(DashMap::new());
-        // let service_handlers = Arc::new(DashMap::new());
-        //
-        // let (writer_tx, writer_rx) = mpsc::channel(64);
-        // let writer_task = tokio::task::spawn(Self::spawn_writer_task(
-        //     fd,
-        //     writer_rx,
-        //     Arc::clone(&pending_replies),
-        //     Arc::clone(&service_handlers),
-        // ));
-        //
-        // let num_workers = Handle::current().metrics().num_workers();
-        // let service_tasks = (0..num_workers)
-        //     .map(|_| {
-        //         tokio::spawn(Self::service_task(
-        //             device_key,
-        //             Arc::clone(&pending_replies),
-        //             Arc::clone(&service_handlers),
-        //         ))
-        //     })
-        //     .collect();
-        //
-        // let device = Self {
-        //     writer_tx,
-        //     cookie_counter: AtomicU64::new(1),
-        //     service_handlers,
-        //     writer_task,
-        //     service_tasks,
-        // };
-        //
-        Arc::new(device)
+                .collect();
+            Self {
+                fd,
+                cookie_counter: AtomicUsize::new(1),
+                looper_threads: loopers,
+                owned_ports: Arc::default(),
+                port_handles: Arc::default(),
+                weak_port_handles: Arc::default(),
+            }
+        });
+        started.store(true, Ordering::Relaxed);
+        dev
     }
 
     /// Spawn the writer task that handles outgoing transactions.
@@ -274,14 +264,13 @@ impl BinderDevice {
             // TODO: don't hardcode this to 0?
             data: FlatBinderObjectData { binder: 0 },
             cookie: handler.cookie(),
-            _lifetime: PhantomData::default(),
         });
 
         let res = unsafe { rustix::ioctl::ioctl(&self.fd, buf) };
         if let Err(e) = &res {
             eprintln!("send_transaction_one_way error: {:?}", e);
         }
-        // TODO: find more accurate error
+        // TODO: find more accurate error, also this probably doesn't actually return an error
         res.map_err(|_| Error::PermissionDenied)
     }
 
@@ -318,18 +307,15 @@ impl BinderDevice {
     ///
     /// When the returned `BinderObject` is dropped, the handler is automatically
     /// unregistered from the device (RAII pattern).
-    pub fn register_object<T: TransactionHandler>(self: &Arc<Self>, handler: T) -> BinderObject<T> {
+    pub fn register_object<T: TransactionHandler>(self: &Arc<Self>, handler: T) -> BinderPort {
         let cookie = self.cookie_counter.fetch_add(1, Ordering::Relaxed);
 
-        let handler = Arc::new(handler);
+        let handler = Box::new(handler);
+        let port = OwnedBinderPort::new(cookie, handler, self.clone());
 
-        self.service_handlers.insert(cookie, handler.clone());
+        self.owned_ports.insert(*port.id(), port.clone());
 
-        BinderObject {
-            device: Arc::downgrade(self),
-            handler,
-            cookie,
-        }
+        BinderPort::Owned(port)
     }
 
     // /// Send a two-way transaction and wait for reply.
@@ -389,34 +375,24 @@ impl BinderDevice {
     //     //     .map_err(|_| Error::Shutdown)
     //     todo!()
     // }
-}
-
-impl Drop for BinderDevice {
-    fn drop(&mut self) {
-        self.exiting.store(true, Ordering::Relaxed);
+    pub(crate) fn remove_binder_port(&self, id: &OwnedBinderPortId) {
+        self.owned_ports.remove(&id);
     }
 }
 
 unsafe fn write_binder_command(fd: BorrowedFd, data: &[u8]) -> rustix::io::Result<()> {
-    let mut write_data = [0u8; 256];
-    let mut read_data = [0u8; 256];
     let mut binder_wr = BinderWriteRead {
-        write_size: write_data.len() as BinderSizeT,
+        write_size: data.len() as BinderSizeT,
         write_consumed: 0,
-        write_buffer: write_data.as_mut_ptr() as BinderUintptrT,
-        read_size: read_data.len() as BinderSizeT,
+        write_buffer: data.as_ptr() as BinderUintptrT,
+        read_size: 0,
         read_consumed: 0,
-        read_buffer: read_data.as_mut_ptr() as BinderUintptrT,
+        read_buffer: 0,
     };
     io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd, &mut binder_wr) })
 }
 
-fn looper(
-    handlers: Arc<DashMap<BinderUintptrT, Arc<dyn DynTransactionHandler>>>,
-    runtime: &tokio::runtime::Handle,
-    exiting: Arc<AtomicBool>,
-    dev_fd: Arc<OwnedFd>,
-) {
+fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>) {
     unsafe {
         write_binder_command(
             dev_fd.as_fd(),
@@ -430,170 +406,212 @@ fn looper(
         .unwrap();
     }
     loop {
-        if exiting.load(Ordering::Relaxed) {
-            break;
-        }
-        let mut write_data = [0u8; 256];
-        let mut read_data = [0u8; 256];
-        let mut binder_wr = BinderWriteRead {
-            write_size: write_data.len() as BinderSizeT,
-            write_consumed: 0,
-            write_buffer: write_data.as_mut_ptr() as BinderUintptrT,
-            read_size: read_data.len() as BinderSizeT,
-            read_consumed: 0,
-            read_buffer: read_data.as_mut_ptr() as BinderUintptrT,
-        };
-        let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(&dev_fd, &mut binder_wr) });
-        if let Err(err) = res {
-            error!("binder write_read call failed: {err}");
-            continue;
-        }
-
-        let read_slice = &read_data[0..binder_wr.read_consumed as usize];
-        let write_slice = &write_data[0..binder_wr.write_consumed as usize];
-        debug!("got: {:x?}, sent: {:x?}", read_slice, write_slice);
-        let header = size_of::<u32>();
-        let ret = BinderReturn::from_u32(unsafe { read_from_slice(&read_slice[..header]) });
-        match ret {
-            BinderReturn::ERROR => {
-                let err = unsafe { read_from_slice::<i32>(&read_slice[header..]) };
-                error!("received binder error: {err}");
-            }
-            BinderReturn::OK => {
-                debug!("received ok");
-            }
-            BinderReturn::TRANSACTION_SEC_CTX | BinderReturn::TRANSACTION => {
-                let (sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
-                    let v = unsafe {
-                        read_from_slice::<BinderTransactionDataSecCtx>(&read_slice[header..])
-                    };
-                    (Some(v.sec_ctx), v.transaction_data)
-                } else {
-                    (None, unsafe {
-                        read_from_slice::<BinderTransactionData>(&read_slice[header..])
-                    })
-                };
-                // Safety: incomming transactions will always use the local identifier
-                let target = unsafe { transaction.target.binder };
-                let Some(handler) = handlers.get(&target) else {
-                    warn!("unable to find handler for: {target:x?}");
-                    continue;
-                };
-                let mut data = vec![0u8; transaction.data_size as usize];
-                // let align = std::mem::align_of::<FlatBinder>();
-                unsafe {
-                    data.copy_from_slice(slice::from_raw_parts(
-                        transaction.data.buffer as *const u8,
-                        transaction.data_size as usize,
-                    ));
-                }
-                let objects = unsafe {
-                    slice::from_raw_parts(
-                        transaction.data.buffer as *const FlatBinderObject,
-                        transaction.offsets_size as usize / size_of::<FlatBinderObject>(),
-                    )
-                    .iter()
-                    .map(|v| BinderObjectEntry::from_flat(v))
-                    .collect::<Option<Vec<_>>>()
-                };
-                let Some(objects) = objects else {
-                    error!("objects is None");
-                    continue;
-                };
-                if transaction.flags.contains(TransactionFlags::ONE_WAY) {
-                    runtime.block_on(handler.as_ref().handle_one_way(Transaction {
-                        code: transaction.code,
-                        payload: Payload { data, objects },
-                    }));
-                } else {
-                    let mut reply = runtime.block_on(handler.as_ref().handle(Transaction {
-                        code: transaction.code,
-                        payload: Payload { data, objects },
-                    }));
-                    let obj_start_offset = reply.data.len();
-                    for obj in reply.objects.iter().map(|v| v.to_flat()) {
-                        unsafe {
-                            let slice = slice::from_raw_parts(
-                                &raw const obj as *const u8,
-                                size_of::<FlatBinderObject>(),
-                            );
-                            reply.data.extend_from_slice(&slice);
-                        }
-                    }
-
-                    let reply = BinderTransactionData {
-                        // unused in reply
-                        target: TransactionTarget { binder: 0 },
-                        // unused in reply
-                        cookie: 0,
-                        code: transaction.code,
-                        flags: transaction.flags,
-                        sender_pid: rustix::process::getpid().as_raw_pid(),
-                        sender_euid: rustix::process::getuid().as_raw(),
-                        data_size: reply.data.len() as BinderSizeT,
-                        offsets_size: (flat_reply_objs.len() * size_of::<FlatBinderObject>())
-                            as BinderSizeT,
-                        data: crate::sys::BinderTransactionDataPtrs {
-                            buffer: reply.data.as_ptr() as u64,
-                            offsets: 0,
-                        },
-                    };
-                }
-            }
-            BinderReturn::REPLY => {
-                let reply =
-                    unsafe { read_from_slice::<BinderTransactionData>(&read_slice[header..]) };
-            }
-            BinderReturn::ACQUIRE_RESULT => {
-                let v = unsafe { read_from_slice::<i32>(&read_slice[header..]) };
-            }
-            BinderReturn::DEAD_REPLY => {}
-            BinderReturn::TRANSACTION_COMPLETE => {}
-            BinderReturn::INCREFS => {
-                let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
-            }
-            BinderReturn::ACQUIRE => {
-                let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
-            }
-            BinderReturn::RELEASE => {
-                let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
-            }
-            BinderReturn::DECREFS => {
-                let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
-            }
-            BinderReturn::ATTEMPT_ACQUIRE => {
-                let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
-            }
-            BinderReturn::NOOP => {}
-            BinderReturn::SPAWN_LOOPER => {
-                info!("binder requested additional looper");
-            }
-            BinderReturn::FINISHED => {}
-            BinderReturn::DEAD_BINDER => {
-                let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
-            }
-            BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
-                let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
-            }
-            BinderReturn::FAILED_REPLY => {}
-            BinderReturn::FROZEN_REPLY => {}
-            BinderReturn::ONEWAY_SPAM_SUSPECT => {}
-            BinderReturn::TRANSACTION_PENDING_FROZEN => {}
-            BinderReturn::FROZEN_BINDER => {
-                let v = unsafe { read_from_slice::<BinderFrozenStateInfo>(&read_slice[header..]) };
-            }
-            BinderReturn::CLEAR_FREEZE_NOTIFICATION_DONE => {
-                let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
-            }
-            msg_type => {
-                error!("unknown binder message: {msg_type:?}");
+        match unsafe { binder_write_read(dev_fd.as_fd(), None, &device, runtime) } {
+            Ok(_) => todo!(),
+            Err(WriteReadError::NotReply) => {}
+            Err(WriteReadError::NoDevice) => {
+                break;
             }
         }
     }
+    info!("exiting looper thread :3");
     // unsafe {
     //     rustix::ioctl::ioctl(&dev_fd, BcExitLooper);
     // }
     // TODO: figure out how the binder thread(not looper) exit call works
+}
+unsafe fn binder_write_read(
+    dev_fd: BorrowedFd,
+    write_data: Option<&[u8]>,
+    device: &Weak<BinderDevice>,
+    runtime: &tokio::runtime::Handle,
+) -> core::result::Result<(u32, PayloadReader), WriteReadError> {
+    let mut read_data = [0u8; 256];
+    let mut binder_wr = BinderWriteRead {
+        write_size: write_data.map(|v| v.len()).unwrap_or(0),
+        write_consumed: 0,
+        write_buffer: write_data
+            .map(|v| v.as_ptr() as BinderUintptrT)
+            .unwrap_or(0),
+        read_size: read_data.len() as BinderSizeT,
+        read_consumed: 0,
+        read_buffer: read_data.as_mut_ptr() as BinderUintptrT,
+    };
+    let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(&dev_fd, &mut binder_wr) });
+    if let Err(err) = res {
+        error!("binder write_read call failed: {err}");
+        return Err(WriteReadError::NotReply);
+    }
+    let Some(device) = device.upgrade() else {
+        return Err(WriteReadError::NoDevice);
+    };
+
+    let read_slice = &read_data[0..binder_wr.read_consumed as usize];
+    debug!("got: {:x?}", read_slice);
+    let header = size_of::<u32>();
+    let ret = BinderReturn::from_u32(unsafe { read_from_slice(&read_slice[..header]) });
+    match ret {
+        BinderReturn::ERROR => {
+            let err = unsafe { read_from_slice::<i32>(&read_slice[header..]) };
+            error!("received binder error: {err}");
+        }
+        BinderReturn::OK => {
+            debug!("received ok");
+        }
+        BinderReturn::TRANSACTION_SEC_CTX | BinderReturn::TRANSACTION => {
+            let (sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
+                let v = unsafe {
+                    read_from_slice::<BinderTransactionDataSecCtx>(&read_slice[header..])
+                };
+                (Some(v.sec_ctx), v.transaction_data)
+            } else {
+                (None, unsafe {
+                    read_from_slice::<BinderTransactionData>(&read_slice[header..])
+                })
+            };
+            // Safety: incomming transactions will always use the local identifier
+            let target = OwnedBinderPortId::from_raw(
+                unsafe { transaction.target.binder },
+                transaction.cookie,
+            );
+            let Some(handler) = device.owned_ports.get(&target) else {
+                warn!("unable to find handler for: {target:x?}");
+                return Err(WriteReadError::NotReply);
+            };
+            let payload_reader = unsafe {
+                PayloadReader::from_raw(
+                    device.clone(),
+                    transaction.data.buffer as *const u8,
+                    transaction.data_size,
+                    transaction.data.offsets as *const usize,
+                    transaction.offsets_size / size_of::<usize>(),
+                )
+            };
+            if transaction.flags.contains(TransactionFlags::ONE_WAY) {
+                runtime.block_on(handler.handler().handle_one_way(Transaction {
+                    code: transaction.code,
+                    payload: payload_reader,
+                }));
+            } else {
+                let reply = runtime.block_on(handler.handler().handle(Transaction {
+                    code: transaction.code,
+                    payload: payload_reader,
+                }));
+
+                let reply = BinderTransactionData {
+                    // unused in reply
+                    target: TransactionTarget { binder: 0 },
+                    // unused in reply
+                    cookie: 0,
+                    code: transaction.code,
+                    flags: transaction.flags,
+                    sender_pid: rustix::process::getpid().as_raw_pid(),
+                    sender_euid: rustix::process::getuid().as_raw(),
+                    data_size: reply.data_buffer_len() as BinderSizeT,
+                    offsets_size: (reply.offset_buffer_len() * size_of::<usize>()) as BinderSizeT,
+                    data: crate::sys::BinderTransactionDataPtrs {
+                        buffer: reply.data_buffer_ptr() as _,
+                        offsets: reply.offset_buffer_ptr() as _,
+                    },
+                };
+                let mut bytes = Vec::new();
+                bytes.copy_from_slice(&BinderCommand::REPLY.as_u32().to_ne_bytes());
+                bytes.copy_from_slice(slice::from_raw_parts(
+                    &raw const reply as _,
+                    size_of_val(&reply),
+                ));
+                write_binder_command(dev_fd, &bytes);
+            }
+        }
+        BinderReturn::REPLY => {
+            let reply = unsafe { read_from_slice::<BinderTransactionData>(&read_slice[header..]) };
+            return Ok((reply.code, unsafe {
+                PayloadReader::from_raw(
+                    device.clone(),
+                    reply.data.buffer as *const u8,
+                    reply.data_size,
+                    reply.data.offsets as *const usize,
+                    reply.offsets_size / size_of::<usize>(),
+                )
+            }));
+        }
+        BinderReturn::ACQUIRE_RESULT => {
+            let v = unsafe { read_from_slice::<i32>(&read_slice[header..]) };
+            info!("attempted strong ref increase result?");
+        }
+        BinderReturn::DEAD_REPLY => {
+            info!("dead reply");
+        }
+        BinderReturn::TRANSACTION_COMPLETE => {
+            info!("transaction complete");
+        }
+        BinderReturn::INCREFS => {
+            let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
+            info!("weak ref increase");
+        }
+        BinderReturn::ACQUIRE => {
+            let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
+            info!("strong ref increase");
+        }
+        BinderReturn::RELEASE => {
+            let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
+            info!("strong ref decrease");
+        }
+        BinderReturn::DECREFS => {
+            let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
+            info!("weak ref decrease");
+        }
+        BinderReturn::ATTEMPT_ACQUIRE => {
+            let v = unsafe { read_from_slice::<BinderPtrCookie>(&read_slice[header..]) };
+            info!("attempt strong ref increase");
+        }
+        BinderReturn::NOOP => {}
+        BinderReturn::SPAWN_LOOPER => {
+            info!("binder requested additional looper");
+        }
+        BinderReturn::FINISHED => {
+            info!("finished?");
+        }
+        BinderReturn::DEAD_BINDER => {
+            let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
+            info!("dead port");
+        }
+        BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
+            let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
+            info!("clear death notif");
+        }
+        BinderReturn::FAILED_REPLY => {
+            info!("clear death notif");
+        }
+        BinderReturn::FROZEN_REPLY => {
+            info!("frozen reply");
+        }
+        BinderReturn::ONEWAY_SPAM_SUSPECT => {
+            info!("oneway spam suspect");
+        }
+        BinderReturn::TRANSACTION_PENDING_FROZEN => {
+            info!("transaction pending frozen")
+        }
+        BinderReturn::FROZEN_BINDER => {
+            let v = unsafe { read_from_slice::<BinderFrozenStateInfo>(&read_slice[header..]) };
+            info!("frozen port")
+        }
+        BinderReturn::CLEAR_FREEZE_NOTIFICATION_DONE => {
+            let v = unsafe { read_from_slice::<BinderUintptrT>(&read_slice[header..]) };
+            info!("cleared freeze notif")
+        }
+        msg_type => {
+            error!("unknown binder message: {msg_type:?}");
+        }
+    }
+    Err(WriteReadError::NotReply)
+}
+#[derive(Error, Debug)]
+enum WriteReadError {
+    #[error("Not a Reply")]
+    NotReply,
+    #[error("No device")]
+    NoDevice,
 }
 unsafe fn read_from_slice<T>(slice: &[u8]) -> T {
     assert!(slice.len() >= size_of::<T>());
@@ -629,7 +647,7 @@ type PendingReply = oneshot::Sender<Result<Payload>>;
 
 #[async_trait::async_trait]
 pub(crate) trait DynTransactionHandler: Send + Sync + 'static {
-    async fn handle(&self, transaction: Transaction) -> Payload;
+    async fn handle(&self, transaction: Transaction) -> PayloadBuilder;
     async fn handle_one_way(&self, transaction: Transaction);
 }
 
@@ -637,7 +655,7 @@ pub trait TransactionHandler: Send + Sync + 'static {
     fn handle(
         &self,
         transaction: Transaction,
-    ) -> impl std::future::Future<Output = Payload> + std::marker::Send;
+    ) -> impl std::future::Future<Output = PayloadBuilder> + std::marker::Send;
 
     fn handle_one_way(
         &self,
@@ -647,7 +665,7 @@ pub trait TransactionHandler: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 impl<T: TransactionHandler> DynTransactionHandler for T {
-    async fn handle(&self, transaction: Transaction) -> Payload {
+    async fn handle(&self, transaction: Transaction) -> PayloadBuilder {
         <Self as TransactionHandler>::handle(&self, transaction).await
     }
 

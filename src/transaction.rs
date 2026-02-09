@@ -2,6 +2,7 @@ use crate::sys::{
     BinderFdObject, BinderObjectHeader, BinderType, FlatBinderFlags, FlatBinderObjectData,
     TransactionFlags,
 };
+use crate::transaction_data::PayloadReader;
 
 use super::binder_ref::BinderRef;
 use super::sys::{BinderTransactionData, BinderUintptrT, FlatBinderObject};
@@ -130,7 +131,7 @@ impl Payload {
 
 pub struct Transaction {
     pub code: u32,
-    pub payload: Payload,
+    pub payload: PayloadReader,
 }
 
 pub enum BinderObject {

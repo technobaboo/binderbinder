@@ -6,6 +6,9 @@ pub mod fs;
 pub mod object;
 pub mod sys;
 pub mod transaction;
+pub mod transaction_data;
+pub mod binder_ports;
+pub mod data_objects;
 
 pub use binder_ref::BinderRef;
 pub use device::{BinderDevice, TransactionHandler};

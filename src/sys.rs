@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::os::fd::RawFd;
 
 use bitflags::bitflags;
 use rustix::ffi::c_void;
@@ -6,8 +6,8 @@ use rustix::ioctl::opcode::{none, read, write};
 use rustix::ioctl::{opcode::read_write, Ioctl};
 use rustix::process::{RawPid, RawUid};
 
-pub type BinderSizeT = u64;
-pub type BinderUintptrT = u64;
+pub type BinderSizeT = usize;
+pub type BinderUintptrT = usize;
 
 /// TODO: value names in debug impl
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,10 +128,10 @@ impl BinderReturn {
     }
 }
 
-pub const BINDER_VERSION: u32 = 0x40046209;
-pub const BINDER_SET_CONTEXT_MGR: u32 = 0x40046207;
-pub const BINDER_SET_MAX_THREADS: u32 = 0x4004620c;
-pub const BINDER_WRITE_READ: u32 = 0xc0306201;
+// pub const BINDER_VERSION: u32 = 0x40046209;
+// pub const BINDER_SET_CONTEXT_MGR: u32 = 0x40046207;
+// pub const BINDER_SET_MAX_THREADS: u32 = 0x4004620c;
+// pub const BINDER_WRITE_READ: u32 = 0xc0306201;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -148,16 +148,15 @@ pub union FlatBinderObjectData {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct FlatBinderObject<'a> {
+pub struct FlatBinderObject {
     pub hdr: BinderObjectHeader,
     pub flags: FlatBinderFlags,
     /// in the uapi this is flattened
     pub data: FlatBinderObjectData,
     pub cookie: BinderUintptrT,
-    pub _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a> std::fmt::Debug for FlatBinderObject<'a> {
+impl std::fmt::Debug for FlatBinderObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlatBinderObject")
             .field("hdr", &self.hdr)
@@ -186,7 +185,7 @@ pub struct BinderFdObject {
     pub hdr: BinderObjectHeader,
     pub pad_flags: u32,
     pub pad_binder: BinderUintptrT,
-    pub fd: u32,
+    pub fd: RawFd,
     pub cookie: BinderUintptrT,
 }
 
@@ -424,8 +423,8 @@ pub const fn binder_type_niche() {
     }
 }
 #[repr(transparent)]
-pub struct SetContextMGR<'a>(pub FlatBinderObject<'a>);
-unsafe impl Ioctl for SetContextMGR<'_> {
+pub struct SetContextMGR(pub FlatBinderObject);
+unsafe impl Ioctl for SetContextMGR {
     type Output = ();
 
     const IS_MUTATING: bool = true;

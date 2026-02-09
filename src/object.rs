@@ -30,7 +30,7 @@ impl<T: TransactionHandler> BinderObject<T> {
 impl<T: TransactionHandler> Drop for BinderObject<T> {
     fn drop(&mut self) {
         if let Some(device) = self.device.upgrade() {
-            device.service_handlers.remove(&self.cookie);
+            device.owned_ports.remove(&self.cookie);
         }
     }
 }
