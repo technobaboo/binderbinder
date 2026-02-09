@@ -1,7 +1,9 @@
 use std::fmt;
 use std::io;
 
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum Error {
     Io(io::Error),
     Os(i32),
@@ -48,29 +50,6 @@ impl fmt::Display for Error {
             Error::DeadReply => write!(f, "dead reply"),
             Error::AlreadyExists => write!(f, "already exists"),
             Error::Unknown(e) => write!(f, "unknown error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<i32> for Error {
-    fn from(errno: i32) -> Self {
-        match errno {
-            0 => unreachable!(),
-            libc::EBADF => Error::InvalidArgument,
-            libc::ENOMEM => Error::OutOfMemory,
-            libc::EACCES => Error::PermissionDenied,
-            libc::EINVAL => Error::InvalidArgument,
-            libc::ENOENT => Error::HandleNotFound(0),
-            libc::EBUSY => Error::AlreadyConnected,
-            _ => Error::Unknown(errno),
         }
     }
 }

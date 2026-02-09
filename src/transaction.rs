@@ -129,11 +129,6 @@ impl Payload {
     }
 }
 
-pub struct Transaction {
-    pub code: u32,
-    pub payload: PayloadReader,
-}
-
 pub enum BinderObject {
     Binder {
         ptr: BinderUintptrT,

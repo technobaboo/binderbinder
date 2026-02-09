@@ -43,6 +43,14 @@ pub struct WeakBinderPortHandle {
 }
 
 impl BinderPortHandle {
+    pub fn get_context_manager_handle(device: &Arc<BinderDevice>) -> Arc<Self> {
+        Self {
+            device: device.clone(),
+            id: 0,
+            dead: AtomicBool::new(false).into(),
+        }
+        .into()
+    }
     pub fn downgrade(&self) -> Option<Arc<WeakBinderPortHandle>> {
         let handle = self
             .device
@@ -55,6 +63,9 @@ impl BinderPortHandle {
             warn!("Failed to find exising weak handle, proper downgrade unimplemented, returning None");
             None
         }
+    }
+    pub(crate) fn handle(&self) -> u32 {
+        self.id
     }
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
@@ -101,7 +112,11 @@ impl WeakBinderPortHandle {
     }
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
-        if let Some(port) = device.weak_port_handles.get(&handle).and_then(|v| v.upgrade()) {
+        if let Some(port) = device
+            .weak_port_handles
+            .get(&handle)
+            .and_then(|v| v.upgrade())
+        {
             // TODO: dedup kernel strong ref
             warn!("dedupped BinderPortHandle, proper kernel ref deduping currently unimplemented, leaking strong refs");
             return port;
@@ -111,7 +126,9 @@ impl WeakBinderPortHandle {
             id: handle,
             dead: Arc::new(AtomicBool::new(false)),
         });
-        device.weak_port_handles.insert(handle, Arc::downgrade(&port));
+        device
+            .weak_port_handles
+            .insert(handle, Arc::downgrade(&port));
         port
     }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {

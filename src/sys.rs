@@ -366,11 +366,11 @@ unsafe impl Ioctl for &mut BinderWriteRead {
     const IS_MUTATING: bool = true;
 
     fn opcode(&self) -> rustix::ioctl::Opcode {
-        read_write::<Self>(b'b', 1)
+        read_write::<BinderWriteRead>(b'b', 1)
     }
 
     fn as_ptr(&mut self) -> *mut c_void {
-        self as *mut _ as *mut _
+        *self as *mut BinderWriteRead as *mut _
     }
 
     unsafe fn output_from_ptr(
