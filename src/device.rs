@@ -471,7 +471,7 @@ unsafe fn binder_write_read(
                 info!("clear death notif");
             }
             BinderReturn::FAILED_REPLY => {
-                info!("clear death notif");
+                info!("failed reply");
             }
             BinderReturn::FROZEN_REPLY => {
                 info!("frozen reply");
