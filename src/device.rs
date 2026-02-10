@@ -307,19 +307,19 @@ unsafe fn binder_write_read(
     // let read_slice = &read_data[0..binder_wr.read_consumed as usize];
     while consumed != binder_wr.read_consumed {
         let read_slice = &read_data[consumed..binder_wr.read_consumed as usize];
-        debug!("got: {:x?}", read_slice);
+        // debug!("got: {:x?}", read_slice);
         let header = size_of::<u32>();
         let ret = BinderReturn::from_u32(unsafe {
             read_from_slice(&read_slice[..header], &mut consumed)
         });
-        debug!("tf? {:?}", ret);
+        // debug!("tf? {:?}", ret);
         match ret {
             BinderReturn::ERROR => {
                 let err = unsafe { read_from_slice::<i32>(&read_slice[header..], &mut consumed) };
                 error!("received binder error: {err}");
             }
             BinderReturn::OK => {
-                debug!("received ok");
+                info!("received ok");
             }
             BinderReturn::TRANSACTION_SEC_CTX | BinderReturn::TRANSACTION => {
                 let (sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
@@ -392,13 +392,13 @@ unsafe fn binder_write_read(
                     ));
                     write_binder_command(dev_fd, &bytes).unwrap();
                 }
-                debug!("transaction?");
+                info!("transaction?");
             }
             BinderReturn::REPLY => {
                 let reply = unsafe {
                     read_from_slice::<BinderTransactionData>(&read_slice[header..], &mut consumed)
                 };
-                debug!("reply?");
+                info!("reply?");
                 return Ok((reply.code, unsafe {
                     PayloadReader::from_raw(
                         device.clone(),
@@ -499,7 +499,7 @@ unsafe fn binder_write_read(
             }
         }
     }
-    info!("idk?");
+    // info!("idk?");
     Err(WriteReadError::NotReply)
 }
 #[derive(Error, Debug)]
