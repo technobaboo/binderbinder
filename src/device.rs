@@ -11,7 +11,6 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::{self};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use std::ffi::c_void;
-use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
@@ -20,19 +19,18 @@ use std::sync::{Arc, Weak};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
 use crate::binder_ports::{
     BinderPort, BinderPortHandle, OwnedBinderPort, OwnedBinderPortId, WeakBinderPortHandle,
 };
 use crate::error::{Error, Result};
+use crate::payload::{PayloadBuilder, PayloadReader};
 use crate::sys::{
     BinderCommand, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn, BinderSizeT,
     BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT, BinderWriteRead,
     SetContextMGR, TransactionFlags, TransactionTarget,
 };
-use crate::transaction_data::{PayloadBuilder, PayloadReader};
 use dashmap::DashMap;
 
 pub struct Transaction {
@@ -44,11 +42,12 @@ pub struct Transaction {
 pub struct BinderDevice {
     fd: Arc<OwnedFd>,
     pub(crate) cookie_counter: AtomicUsize,
-    looper_threads: Vec<std::thread::JoinHandle<()>>,
+    _looper_threads: Vec<std::thread::JoinHandle<()>>,
     pub(crate) owned_ports: Arc<DashMap<OwnedBinderPortId, Arc<OwnedBinderPort>>>,
     pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderPortHandle>>>,
     pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderPortHandle>>>,
-    backing: BinderBackingMemMap,
+    // needed for safety
+    _backing: BinderBackingMemMap,
 }
 
 impl BinderDevice {
@@ -88,15 +87,19 @@ impl BinderDevice {
             Self {
                 fd,
                 cookie_counter: AtomicUsize::new(1),
-                looper_threads: loopers,
+                _looper_threads: loopers,
                 owned_ports: Arc::default(),
                 port_handles: Arc::default(),
                 weak_port_handles: Arc::default(),
-                backing,
+                _backing: backing,
             }
         });
         started.store(true, Ordering::Relaxed);
         dev
+    }
+
+    pub fn context_manager_handle(self: &Arc<Self>) -> Arc<BinderPortHandle> {
+        BinderPortHandle::get_context_manager_handle(&self)
     }
 
     /// Register a handler for incoming transactions and return a binder object.
@@ -122,16 +125,31 @@ impl BinderDevice {
     // TODO: make this work with weak handles
     pub fn transact_blocking<'a>(
         self: &Arc<Self>,
-        target: &BinderPortHandle,
+        target: &BinderPort,
         code: u32,
         data: PayloadBuilder<'_>,
     ) -> Result<(u32, PayloadReader)> {
         info!("transact_blocking");
         let reply = BinderTransactionData {
-            target: TransactionTarget {
-                handle: target.handle(),
+            target: match target {
+                BinderPort::Owned(target) => TransactionTarget {
+                    binder: target.id().id,
+                },
+                BinderPort::Handle(target) => TransactionTarget {
+                    handle: target.handle(),
+                },
+                BinderPort::WeakHandle(target) => TransactionTarget {
+                    handle: target.handle(),
+                },
+                BinderPort::WeakOwned(target) => TransactionTarget {
+                    binder: target.id().id,
+                },
             },
-            cookie: 0,
+            cookie: match target {
+                BinderPort::Owned(target) => target.id().cookie,
+                BinderPort::Handle(_) | BinderPort::WeakHandle(_) => 0,
+                BinderPort::WeakOwned(target) => target.id().cookie,
+            },
             code,
             // TODO: actually expose some of these in a reasonable way
             flags: TransactionFlags::ACCEPT_FDS,
@@ -510,7 +528,7 @@ pub trait TransactionHandler: Send + Sync + 'static {
     fn handle(
         &self,
         transaction: Transaction,
-    ) -> impl std::future::Future<Output = PayloadBuilder> + std::marker::Send;
+    ) -> impl std::future::Future<Output = PayloadBuilder<'_>> + std::marker::Send;
 
     fn handle_one_way(
         &self,

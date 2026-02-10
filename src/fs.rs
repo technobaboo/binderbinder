@@ -1,5 +1,5 @@
 use crate::sys::BinderfsDevice;
-use std::os::unix::io::OwnedFd;
+use std::{ffi::OsStr, os::unix::{ffi::OsStrExt, io::OwnedFd}, path::Path, process::Command};
 
 pub const BINDERFS_DEV_MAJOR: u64 = 0;
 pub const BINDERFS_DEV_MINOR: u32 = 0;
@@ -9,12 +9,23 @@ pub struct Binderfs {
     path: std::path::PathBuf,
     control_fd: OwnedFd,
 }
+fn is_mounted(path: &Path) -> bool {
+    let output = Command::new("findmnt")
+        .arg("-M")
+        .arg(path)
+        .arg("--pairs")
+        .output()
+        .expect("Failed to check for binderfs, might be missing findmnt");
+    let str = String::from_utf8_lossy(&output.stdout);
+    str.contains("SOURCE=\"binder\"") && str.contains("FSTYPE=\"binder\"")
+}
+
 impl Binderfs {
     pub fn mount_default() -> std::io::Result<Self> {
         Self::mount(DEFAULT_BINDERFS_PATH)
     }
 
-    pub fn mount(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    pub fn mount(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
@@ -22,7 +33,6 @@ impl Binderfs {
         }
 
         if !path.is_dir() {
-            println!("hm");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotADirectory,
                 "binderfs path is not a directory",
@@ -31,12 +41,14 @@ impl Binderfs {
 
         // ideally we would check if the target dir is alread mounted as a binderfs but idk how to
         // do that rn
-        std::process::Command::new("mount")
-            .arg("-t")
-            .arg("binder")
-            .arg("binder")
-            .arg(path)
-            .status()?;
+        if !is_mounted(path) {
+            Command::new("mount")
+                .arg("-t")
+                .arg("binder")
+                .arg("binder")
+                .arg(path)
+                .status()?;
+        }
 
         let control_fd = OwnedFd::from(
             std::fs::OpenOptions::new()
@@ -51,7 +63,8 @@ impl Binderfs {
         })
     }
 
-    pub fn create_device(&self, name: &str) -> std::io::Result<OwnedFd> {
+    pub fn create_device(&self, name: impl AsRef<OsStr>) -> std::io::Result<OwnedFd> {
+        let name = name.as_ref();
         if name.len() > 255 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -77,7 +90,7 @@ impl Binderfs {
         Ok(OwnedFd::from(fd))
     }
 
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 

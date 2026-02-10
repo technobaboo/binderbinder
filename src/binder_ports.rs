@@ -110,6 +110,9 @@ impl WeakBinderPortHandle {
             None
         }
     }
+    pub(crate) fn handle(&self) -> u32 {
+        self.id
+    }
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
         if let Some(port) = device
