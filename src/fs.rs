@@ -1,5 +1,10 @@
 use crate::sys::BinderfsDevice;
-use std::{ffi::OsStr, os::unix::{ffi::OsStrExt, io::OwnedFd}, path::Path, process::Command};
+use std::{
+    ffi::OsStr,
+    os::unix::{ffi::OsStrExt, io::OwnedFd},
+    path::Path,
+    process::Command,
+};
 
 pub const BINDERFS_DEV_MAJOR: u64 = 0;
 pub const BINDERFS_DEV_MINOR: u32 = 0;

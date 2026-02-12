@@ -11,7 +11,9 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
-    binder_object::{BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef},
+    binder_object::{
+        BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef,
+    },
     sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
         BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
