@@ -37,6 +37,14 @@ impl BinderObjectOrRef {
             BinderObjectOrRef::WeakObject(p) => p.get_flat_binder_object(),
         }
     }
+    pub fn alive(&self) -> bool {
+        match self {
+            BinderObjectOrRef::Object(_) => true,
+            BinderObjectOrRef::WeakObject(_) => true,
+            BinderObjectOrRef::Ref(p) => !p.dead.load(Ordering::Relaxed),
+            BinderObjectOrRef::WeakRef(p) => !p.dead.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The remote side of a [`BinderObject`]
