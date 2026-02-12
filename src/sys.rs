@@ -14,20 +14,35 @@ const fn b_pack_chars(c1: u8, c2: u8, c3: u8, c4: u8) -> u32 {
     ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
 }
 const B_TYPE_LARGE: u8 = 0x85;
-/// TODO: value names in debug impl
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct BinderType(u32);
-impl BinderType {
-    pub const BINDER: Self = Self(b_pack_chars(b's', b'b', b'*', B_TYPE_LARGE));
-    pub const WEAK_BINDER: Self = Self(b_pack_chars(b'w', b'b', b'*', B_TYPE_LARGE));
-    pub const HANDLE: Self = Self(b_pack_chars(b's', b'h', b'*', B_TYPE_LARGE));
-    pub const WEAK_HANDLE: Self = Self(b_pack_chars(b'w', b'h', b'*', B_TYPE_LARGE));
-    pub const FD: Self = Self(b_pack_chars(b'f', b'd', b'*', B_TYPE_LARGE));
-    /// Fd array
-    pub const FDA: Self = Self(b_pack_chars(b'f', b'd', b'a', B_TYPE_LARGE));
-    pub const PTR: Self = Self(b_pack_chars(b'p', b't', b'*', B_TYPE_LARGE));
+
+macro_rules! non_exhaustive_enum {
+    ($type:ident, $($name:ident = $value:expr,)*) => {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[repr(transparent)]
+        pub struct $type(u32);
+        impl $type {
+            $(pub const $name: Self = Self($value);)*
+        }
+        impl Debug for $type {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple(stringify!($type)).field(match *self {
+                    $(Self::$name => &stringify!($name),)*
+                    _ => &self.0,
+                }).finish()
+            }
+        }
+    };
 }
+non_exhaustive_enum!(
+    BinderType,
+    BINDER = b_pack_chars(b's', b'b', b'*', B_TYPE_LARGE),
+    WEAK_BINDER = b_pack_chars(b'w', b'b', b'*', B_TYPE_LARGE),
+    HANDLE = b_pack_chars(b's', b'h', b'*', B_TYPE_LARGE),
+    WEAK_HANDLE = b_pack_chars(b'w', b'h', b'*', B_TYPE_LARGE),
+    FD = b_pack_chars(b'f', b'd', b'*', B_TYPE_LARGE),
+    FDA = b_pack_chars(b'f', b'd', b'a', B_TYPE_LARGE),
+    PTR = b_pack_chars(b'p', b't', b'*', B_TYPE_LARGE),
+);
 
 bitflags! {
     #[repr(transparent)]
@@ -65,69 +80,65 @@ bitflags! {
     }
 }
 
-/// TODO: value names in debug impl
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct BinderCommand(u32);
+non_exhaustive_enum!(
+    BinderCommand,
+    TRANSACTION = write::<BinderTransactionData>(b'c', 0),
+    REPLY = write::<BinderTransactionData>(b'c', 1),
+    ACQUIRE_RESULT = write::<i32>(b'c', 2),
+    FREE_BUFFER = write::<BinderUintptrT>(b'c', 3),
+    INCREFS = write::<u32>(b'c', 4),
+    ACQUIRE = write::<u32>(b'c', 5),
+    RELEASE = write::<u32>(b'c', 6),
+    DECREFS = write::<u32>(b'c', 7),
+    INCREFS_DONE = write::<BinderPtrCookie>(b'c', 8),
+    ACQUIRE_DONE = write::<BinderPtrCookie>(b'c', 9),
+    ATTEMPT_ACQUIRE = write::<BinderPriorityDesc>(b'c', 10),
+    REGISTER_LOOPER = none(b'c', 11),
+    ENTER_LOOPER = none(b'c', 12),
+    EXIT_LOOPER = none(b'c', 13),
+    REQUEST_DEATH_NOTIFICATION = write::<BinderHandleCookie>(b'c', 14),
+    CLEAR_DEATH_NOTIFICATION = write::<BinderHandleCookie>(b'c', 15),
+    DEAD_BINDER_DONE = write::<BinderUintptrT>(b'c', 16),
+    TRANSACTION_SG = write::<BinderTransactionDataSg>(b'c', 17),
+    REPLY_SG = write::<BinderTransactionDataSg>(b'c', 18),
+    REQUEST_FREEZE_NOTIFICATION = write::<BinderHandleCookie>(b'c', 19),
+    CLEAR_FREEZE_NOTIFICATION = write::<BinderHandleCookie>(b'c', 20),
+    FREEZE_NOTIFICATION_DONE = write::<BinderUintptrT>(b'c', 21),
+);
 impl BinderCommand {
-    pub const TRANSACTION: Self = Self(write::<BinderTransactionData>(b'c', 0));
-    pub const REPLY: Self = Self(write::<BinderTransactionData>(b'c', 1));
-    pub const ACQUIRE_RESULT: Self = Self(write::<i32>(b'c', 2));
-    pub const FREE_BUFFER: Self = Self(write::<BinderUintptrT>(b'c', 3));
-    pub const INCREFS: Self = Self(write::<u32>(b'c', 4));
-    pub const ACQUIRE: Self = Self(write::<u32>(b'c', 5));
-    pub const RELEASE: Self = Self(write::<u32>(b'c', 6));
-    pub const DECREFS: Self = Self(write::<u32>(b'c', 7));
-    pub const INCREFS_DONE: Self = Self(write::<BinderPtrCookie>(b'c', 8));
-    pub const ACQUIRE_DONE: Self = Self(write::<BinderPtrCookie>(b'c', 9));
-    pub const ATTEMPT_ACQUIRE: Self = Self(write::<BinderPriorityDesc>(b'c', 10));
-    pub const REGISTER_LOOPER: Self = Self(none(b'c', 11));
-    pub const ENTER_LOOPER: Self = Self(none(b'c', 12));
-    pub const EXIT_LOOPER: Self = Self(none(b'c', 13));
-    pub const REQUEST_DEATH_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 14));
-    pub const CLEAR_DEATH_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 15));
-    pub const DEAD_BINDER_DONE: Self = Self(write::<BinderUintptrT>(b'c', 16));
-    pub const TRANSACTION_SG: Self = Self(write::<BinderTransactionDataSg>(b'c', 17));
-    pub const REPLY_SG: Self = Self(write::<BinderTransactionDataSg>(b'c', 18));
-    pub const REQUEST_FREEZE_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 19));
-    pub const CLEAR_FREEZE_NOTIFICATION: Self = Self(write::<BinderHandleCookie>(b'c', 20));
-    pub const FREEZE_NOTIFICATION_DONE: Self = Self(write::<BinderUintptrT>(b'c', 21));
-
     pub fn as_u32(&self) -> u32 {
         self.0
     }
 }
 
-/// TODO: value names in debug impl
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct BinderReturn(u32);
+non_exhaustive_enum!(
+    BinderReturn,
+    ERROR = read::<i32>(b'r', 0),
+    OK = none(b'r', 1),
+    TRANSACTION_SEC_CTX = read::<BinderTransactionDataSecCtx>(b'r', 2),
+    TRANSACTION = read::<BinderTransactionData>(b'r', 2),
+    REPLY = read::<BinderTransactionData>(b'r', 3),
+    ACQUIRE_RESULT = read::<i32>(b'r', 4),
+    DEAD_REPLY = none(b'r', 5),
+    TRANSACTION_COMPLETE = none(b'r', 6),
+    INCREFS = read::<BinderPtrCookie>(b'r', 7),
+    ACQUIRE = read::<BinderPtrCookie>(b'r', 8),
+    RELEASE = read::<BinderPtrCookie>(b'r', 9),
+    DECREFS = read::<BinderPtrCookie>(b'r', 10),
+    ATTEMPT_ACQUIRE = read::<BinderPriorityPtrCookie>(b'r', 11),
+    NOOP = none(b'r', 12),
+    SPAWN_LOOPER = none(b'r', 13),
+    FINISHED = none(b'r', 14),
+    DEAD_BINDER = read::<BinderUintptrT>(b'r', 15),
+    CLEAR_DEATH_NOTIFICATION_DONE = read::<BinderUintptrT>(b'r', 16),
+    FAILED_REPLY = none(b'r', 17),
+    FROZEN_REPLY = none(b'r', 18),
+    ONEWAY_SPAM_SUSPECT = none(b'r', 19),
+    TRANSACTION_PENDING_FROZEN = none(b'r', 20),
+    FROZEN_BINDER = read::<BinderFrozenStateInfo>(b'r', 21),
+    CLEAR_FREEZE_NOTIFICATION_DONE = read::<BinderUintptrT>(b'r', 22),
+);
 impl BinderReturn {
-    pub const ERROR: Self = Self(read::<i32>(b'r', 0));
-    pub const OK: Self = Self(none(b'r', 1));
-    pub const TRANSACTION_SEC_CTX: Self = Self(read::<BinderTransactionDataSecCtx>(b'r', 2));
-    pub const TRANSACTION: Self = Self(read::<BinderTransactionData>(b'r', 2));
-    pub const REPLY: Self = Self(read::<BinderTransactionData>(b'r', 3));
-    pub const ACQUIRE_RESULT: Self = Self(read::<i32>(b'r', 4));
-    pub const DEAD_REPLY: Self = Self(none(b'r', 5));
-    pub const TRANSACTION_COMPLETE: Self = Self(none(b'r', 6));
-    pub const INCREFS: Self = Self(read::<BinderPtrCookie>(b'r', 7));
-    pub const ACQUIRE: Self = Self(read::<BinderPtrCookie>(b'r', 8));
-    pub const RELEASE: Self = Self(read::<BinderPtrCookie>(b'r', 9));
-    pub const DECREFS: Self = Self(read::<BinderPtrCookie>(b'r', 10));
-    pub const ATTEMPT_ACQUIRE: Self = Self(read::<BinderPriorityPtrCookie>(b'r', 11));
-    pub const NOOP: Self = Self(none(b'r', 12));
-    pub const SPAWN_LOOPER: Self = Self(none(b'r', 13));
-    pub const FINISHED: Self = Self(none(b'r', 14));
-    pub const DEAD_BINDER: Self = Self(read::<BinderUintptrT>(b'r', 15));
-    pub const CLEAR_DEATH_NOTIFICATION_DONE: Self = Self(read::<BinderUintptrT>(b'r', 16));
-    pub const FAILED_REPLY: Self = Self(none(b'r', 17));
-    pub const FROZEN_REPLY: Self = Self(none(b'r', 18));
-    pub const ONEWAY_SPAM_SUSPECT: Self = Self(none(b'r', 19));
-    pub const TRANSACTION_PENDING_FROZEN: Self = Self(none(b'r', 20));
-    pub const FROZEN_BINDER: Self = Self(read::<BinderFrozenStateInfo>(b'r', 21));
-    pub const CLEAR_FREEZE_NOTIFICATION_DONE: Self = Self(read::<BinderUintptrT>(b'r', 22));
-
     pub fn from_u32(v: u32) -> Self {
         Self(v)
     }
@@ -172,14 +183,9 @@ impl Debug for FlatBinderObject {
             .field(
                 "data",
                 match self.hdr.type_ {
-                    // TODO: figure out if this is even correct, lol
-                    BinderType::BINDER
-                    | BinderType::FD
-                    | BinderType::WEAK_BINDER
-                    | BinderType::FDA
-                    | BinderType::PTR => unsafe { &self.data.binder },
+                    BinderType::BINDER | BinderType::WEAK_BINDER => unsafe { &self.data.binder },
                     BinderType::HANDLE | BinderType::WEAK_HANDLE => unsafe { &self.data.handle },
-                    _ => &"unknown",
+                    _ => &"invalid binder type",
                 },
             )
             .field("cookie", &self.cookie)

@@ -14,8 +14,8 @@ use crate::{
     BinderDevice,
 };
 
-#[derive(Debug)]
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
+#[derive(Debug)]
 pub enum BinderObjectOrRef {
     Object(Arc<BinderObject>),
     WeakObject(WeakBinderObject),
@@ -33,35 +33,20 @@ impl BinderObjectOrRef {
     }
 }
 
-/// The owned/local side of a [`BinderObject`]
+#[derive(Debug)]
+/// The remote side of a [`BinderObject`]
 pub struct BinderRef {
     device: Arc<BinderDevice>,
     id: u32,
     dead: Arc<AtomicBool>,
 }
 
-impl Debug for BinderRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BinderRef")
-            .field("id", &self.id)
-            .field("dead", &self.dead)
-            .finish()
-    }
-}
-/// The owned/local side of a [`WeakBinderObject`]
+#[derive(Debug)]
+/// Weak version of [`BinderRef`]
 pub struct WeakBinderRef {
     device: Arc<BinderDevice>,
     id: u32,
     dead: Arc<AtomicBool>,
-}
-
-impl Debug for WeakBinderRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WeakBinderRef")
-            .field("id", &self.id)
-            .field("dead", &self.dead)
-            .finish()
-    }
 }
 
 impl BinderRef {
@@ -197,6 +182,7 @@ pub struct BinderObject {
 impl Debug for BinderObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BinderObject")
+            .field("device", &self.device)
             .field("id", &self.id)
             .finish()
     }
@@ -234,19 +220,12 @@ impl BinderObject {
     }
 }
 
-/// Only returned if a remote process sends a [`WeakBinderPortHandle`] to the process owning the [`BinderPort`]
+/// Only returned if a remote process sends a [`WeakBinderRef`] to the process owning the [`BinderObject`]
+#[derive(Debug)]
 pub struct WeakBinderObject {
     // TODO: is this needed?
     device: Arc<BinderDevice>,
     id: BinderObjectId,
-}
-
-impl Debug for WeakBinderObject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WeakBinderObject")
-            .field("id", &self.id)
-            .finish()
-    }
 }
 
 impl WeakBinderObject {

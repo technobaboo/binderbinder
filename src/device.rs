@@ -10,10 +10,8 @@ use core::slice;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
-use rustix::process;
 use std::ffi::c_void;
-use std::ops::Deref;
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,9 +19,9 @@ use std::sync::{Arc, Weak};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::binder_ports::{
+use crate::binder_object::{
     BinderObject, BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderRef,
 };
 use crate::error::{Error, Result};
@@ -43,7 +41,7 @@ pub struct Transaction {
 /// Shared binder device state.
 #[derive(Debug)]
 pub struct BinderDevice {
-    fd: Arc<OwnedFdWrapper>,
+    fd: Arc<OwnedFd>,
     pub(crate) cookie_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
     pub(crate) owned_ports: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
@@ -73,7 +71,7 @@ impl BinderDevice {
     }
     /// Create a new BinderDevice from an already-open fd.
     pub fn from_fd(fd: impl Into<OwnedFd>) -> Arc<Self> {
-        let fd = Arc::new(OwnedFdWrapper(fd.into()));
+        let fd = Arc::new(fd.into());
         debug!("dev fd: {}", fd.as_raw_fd());
         let backing = BinderBackingMemMap::new(fd.as_fd(), 1024 * 1024);
         let started = Arc::new(AtomicBool::new(false));
@@ -176,10 +174,10 @@ impl BinderDevice {
         self.owned_ports.remove(&id);
     }
     pub(crate) unsafe fn write_binder_command(&self, data: &[u8]) {
-        write_binder_command(self.fd.as_fd(), data).unwrap()
+        write_binder_command(&self.fd, data).unwrap()
     }
     pub(crate) unsafe fn write_binder_struct_command<T>(&self, command: BinderCommand, data: &T) {
-        write_binder_struct_command(self.fd.as_fd(), command, data).unwrap()
+        write_binder_struct_command(&self.fd, command, data).unwrap()
     }
 }
 impl BinderDevice {
@@ -229,19 +227,27 @@ impl BinderDevice {
         let mut write_data = Some(bytes.as_slice());
         let v = loop {
             let v = unsafe {
-                binder_write_read(
-                    self.fd.as_fd(),
-                    write_data.take(),
-                    &Arc::downgrade(self),
-                    &runtime,
-                )
+                binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), &runtime)
             };
             match v {
-                Ok(v) => break Ok(v),
-                Err(WriteReadError::NotReply) => continue,
-                Err(WriteReadError::NoDevice) => {
+                Some(Ok(v)) => break Ok(v),
+                Some(Err(WriteReadError::NoDevice)) => {
                     break Err(Error::Shutdown);
                 }
+                Some(Err(WriteReadError::DeadReply)) => {
+                    break Err(Error::DeadReply);
+                }
+                Some(Err(WriteReadError::ObjectNotFound)) => {
+                    break Err(Error::ObjectNotFound);
+                }
+                Some(Err(WriteReadError::FailedReply)) => {
+                    error!("{}", WriteReadError::FailedReply);
+                    break Err(Error::Unknown(1));
+                }
+                Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
+                    break Err(Error::Binder(err));
+                }
+                None => continue,
             }
         };
         info!(fds=?data.fds());
@@ -280,8 +286,8 @@ impl Drop for BinderBackingMemMap {
     }
 }
 
-unsafe fn write_binder_struct_command<T>(
-    fd: BorrowedFd,
+unsafe fn write_binder_struct_command<T, Fd: AsFd>(
+    fd: impl AsRef<Fd>,
     command: BinderCommand,
     data: &T,
 ) -> rustix::io::Result<()> {
@@ -299,9 +305,12 @@ unsafe fn write_binder_struct_command<T>(
         read_consumed: 0,
         read_buffer: 0,
     };
-    io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd, &mut binder_wr) })
+    io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd.as_ref(), &mut binder_wr) })
 }
-unsafe fn write_binder_command(fd: BorrowedFd, data: &[u8]) -> rustix::io::Result<()> {
+unsafe fn write_binder_command<Fd: AsFd>(
+    fd: impl AsRef<Fd>,
+    data: &[u8],
+) -> rustix::io::Result<()> {
     let mut binder_wr = BinderWriteRead {
         write_size: data.len() as BinderSizeT,
         write_consumed: 0,
@@ -310,58 +319,43 @@ unsafe fn write_binder_command(fd: BorrowedFd, data: &[u8]) -> rustix::io::Resul
         read_consumed: 0,
         read_buffer: 0,
     };
-    io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd, &mut binder_wr) })
+    io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd.as_ref(), &mut binder_wr) })
 }
 
-#[derive(Debug)]
-struct OwnedFdWrapper(OwnedFd);
-impl Deref for OwnedFdWrapper {
-    type Target = OwnedFd;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Drop for OwnedFdWrapper {
-    fn drop(&mut self) {
-        warn!("dev fd dropped somehow")
-    }
-}
-
-fn looper(
-    runtime: &tokio::runtime::Handle,
-    device: Weak<BinderDevice>,
-    dev_fd: Arc<OwnedFdWrapper>,
-) {
+fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>) {
     let mut init_data = Vec::new();
     // init_data.extend_from_slice(&BinderCommand::REGISTER_LOOPER.as_u32().to_ne_bytes());
     init_data.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
     let mut init_data = Some(init_data.as_slice());
     loop {
-        match unsafe { binder_write_read(dev_fd.as_fd(), init_data.take(), &device, runtime) } {
-            Ok(_) => todo!(),
-            Err(WriteReadError::NotReply) => {}
-            Err(WriteReadError::NoDevice) => {
+        match unsafe { binder_write_read(&dev_fd, init_data.take(), &device, runtime) } {
+            Some(Ok(_)) => todo!(),
+            Some(Err(WriteReadError::NoDevice)) => {
                 break;
             }
+            Some(Err(WriteReadError::DeadReply)) => {}
+            Some(Err(WriteReadError::ObjectNotFound)) => {}
+            Some(Err(WriteReadError::FailedReply)) => {
+                error!("{}", WriteReadError::FailedReply);
+            }
+            Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
+                error!("WriteRead failed: {err}");
+            }
+            None => {}
         }
     }
     info!("exiting looper thread :3");
     unsafe {
-        write_binder_command(
-            dev_fd.as_fd(),
-            &BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes(),
-        )
-        .unwrap();
+        write_binder_command(dev_fd, &BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes()).unwrap();
     }
     // TODO: figure out how the binder thread(not looper) exit call works
 }
 unsafe fn binder_write_read(
-    dev_fd: BorrowedFd,
+    dev_fd: &Arc<OwnedFd>,
     write_data: Option<&[u8]>,
     device: &Weak<BinderDevice>,
     runtime: &tokio::runtime::Handle,
-) -> core::result::Result<(u32, PayloadReader), WriteReadError> {
+) -> Option<core::result::Result<(u32, PayloadReader), WriteReadError>> {
     let mut read_data = [0u8; 256];
     let mut binder_wr = BinderWriteRead {
         write_size: write_data.map(|v| v.len()).unwrap_or(0),
@@ -380,18 +374,12 @@ unsafe fn binder_write_read(
     let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(&dev_fd, &mut binder_wr) });
     if let Err(err) = res {
         error!("binder write_read call failed: {err}");
-        if err.raw_os_error() == 9 {
-            info!("fd: {}", dev_fd.as_raw_fd());
-            std::process::exit(1);
-            panic!("a");
-        }
-        return Err(WriteReadError::NotReply);
+        return Some(Err(WriteReadError::WriteReadIoctlFailed(err)));
     }
     let Some(device) = device.upgrade() else {
-        return Err(WriteReadError::NoDevice);
+        return Some(Err(WriteReadError::NoDevice));
     };
     let mut consumed = 0;
-    // let read_slice = &read_data[0..binder_wr.read_consumed as usize];
     while consumed != binder_wr.read_consumed {
         let read_slice = &read_data[consumed..binder_wr.read_consumed as usize];
         debug!("got: {:x?}", read_slice);
@@ -399,14 +387,13 @@ unsafe fn binder_write_read(
         let ret = BinderReturn::from_u32(unsafe {
             read_from_slice(&read_slice[..header], &mut consumed)
         });
-        // debug!("tf? {:?}", ret);
         match ret {
             BinderReturn::ERROR => {
                 let err = unsafe { read_from_slice::<i32>(&read_slice[header..], &mut consumed) };
                 error!("received binder error: {err}");
             }
             BinderReturn::OK => {
-                info!("received ok");
+                debug!("received ok");
             }
             BinderReturn::TRANSACTION_SEC_CTX | BinderReturn::TRANSACTION => {
                 let (sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
@@ -432,7 +419,7 @@ unsafe fn binder_write_read(
                 );
                 let Some(handler) = device.owned_ports.get(&target) else {
                     warn!("unable to find handler for: {target:x?}");
-                    return Err(WriteReadError::NotReply);
+                    return Some(Err(WriteReadError::ObjectNotFound));
                 };
                 let payload_reader = unsafe {
                     PayloadReader::from_kernel_raw(
@@ -480,14 +467,13 @@ unsafe fn binder_write_read(
                     write_binder_command(dev_fd, &bytes).unwrap();
                     drop(reply_data);
                 }
-                // info!("transaction?");
             }
             BinderReturn::REPLY => {
                 let reply = unsafe {
                     read_from_slice::<BinderTransactionData>(&read_slice[header..], &mut consumed)
                 };
-                info!("reply?");
-                return Ok((reply.code, unsafe {
+                trace!("received reply");
+                return Some(Ok((reply.code, unsafe {
                     PayloadReader::from_kernel_raw(
                         device.clone(),
                         reply.data.buffer as *const u8,
@@ -495,112 +481,126 @@ unsafe fn binder_write_read(
                         reply.data.offsets as *const usize,
                         reply.offsets_size / size_of::<usize>(),
                     )
-                }));
+                })));
             }
+            // TODO: implement?
             BinderReturn::ACQUIRE_RESULT => {
                 let v = unsafe { read_from_slice::<i32>(&read_slice[header..], &mut consumed) };
-                info!("attempted strong ref increase result?");
+                debug!("attempted strong ref increase result?");
             }
             BinderReturn::DEAD_REPLY => {
-                info!("dead reply");
+                return Some(Err(WriteReadError::DeadReply));
             }
+            // TODO: implement
             BinderReturn::TRANSACTION_COMPLETE => {
-                info!("transaction complete");
+                debug!("transaction complete");
             }
             BinderReturn::INCREFS => {
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
+                // TODO: actually track maybe?
                 _ = write_binder_struct_command(dev_fd, BinderCommand::INCREFS_DONE, &v)
                     .inspect_err(|err| error!("failed to send INCREFS_DONE: {err}"));
-                info!("weak ref increase");
             }
             BinderReturn::ACQUIRE => {
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
+                // TODO: actually track
                 _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &v)
                     .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
-                info!("strong ref increase");
             }
             BinderReturn::RELEASE => {
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                info!("strong ref decrease");
+                // TODO: actually track
+                debug!("strong ref decrease");
             }
             BinderReturn::DECREFS => {
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                info!("weak ref decrease");
+                // TODO: actually track maybe?
+                debug!("weak ref decrease");
             }
             BinderReturn::ATTEMPT_ACQUIRE => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                info!("attempt strong ref increase");
+                debug!("attempt strong ref increase, should be unused i think?");
             }
             BinderReturn::NOOP => {
-                debug!("noop?");
+                trace!("noop?");
             }
             BinderReturn::SPAWN_LOOPER => {
-                info!("binder requested additional looper");
+                let device = Arc::downgrade(&device);
+                let dev_fd = dev_fd.clone();
+                let runtime = runtime.clone();
+                std::thread::spawn(move || looper(&runtime, device, dev_fd));
             }
             BinderReturn::FINISHED => {
-                info!("finished?");
+                debug!("finished?");
             }
             BinderReturn::DEAD_BINDER => {
                 let v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                info!("dead port");
+                // TODO: impl
+                debug!("dead binder?");
             }
             BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
                 let v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                info!("clear death notif");
+                // TODO: impl?
+                debug!("clear death notif");
             }
             BinderReturn::FAILED_REPLY => {
-                info!("failed reply: {:?}", unsafe { device.get_last_error() });
-                return Err(WriteReadError::NoDevice);
+                warn!("failed reply: {:?}", unsafe { device.get_last_error() });
+                return Some(Err(WriteReadError::FailedReply));
             }
             BinderReturn::FROZEN_REPLY => {
-                info!("frozen reply");
+                debug!("frozen reply");
             }
             BinderReturn::ONEWAY_SPAM_SUSPECT => {
-                info!("oneway spam suspect");
+                debug!("oneway spam suspect");
             }
             BinderReturn::TRANSACTION_PENDING_FROZEN => {
-                info!("transaction pending frozen")
+                debug!("transaction pending frozen")
             }
             BinderReturn::FROZEN_BINDER => {
                 let v = unsafe {
                     read_from_slice::<BinderFrozenStateInfo>(&read_slice[header..], &mut consumed)
                 };
-                info!("frozen port")
+                debug!("frozen object")
             }
             BinderReturn::CLEAR_FREEZE_NOTIFICATION_DONE => {
                 let v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                info!("cleared freeze notif")
+                debug!("cleared freeze notif")
             }
             msg_type => {
                 error!("unknown binder message: {msg_type:?}");
             }
         }
     }
-    // info!("idk?");
-    Err(WriteReadError::NotReply)
+    None
 }
 #[derive(Error, Debug)]
 enum WriteReadError {
-    #[error("Not a Reply")]
-    NotReply,
+    #[error("BinderObject for transaction target not found")]
+    ObjectNotFound,
+    #[error("Dead Reply")]
+    DeadReply,
+    #[error("Reply Failed")]
+    FailedReply,
     #[error("No device")]
     NoDevice,
+    #[error("WriteRead failed: {0}")]
+    WriteReadIoctlFailed(Errno),
 }
 unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
     assert!(slice.len() >= size_of::<T>());

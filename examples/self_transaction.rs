@@ -1,5 +1,8 @@
 use binderbinder::{
-    BinderDevice, TransactionHandler, binder_ports::{BinderObjectOrRef, BinderRef}, device::Transaction, payload::{BinderObjectType, PayloadBuilder}
+    binder_object::{BinderObjectOrRef, BinderRef},
+    device::Transaction,
+    payload::{BinderObjectType, PayloadBuilder},
+    BinderDevice, TransactionHandler,
 };
 use tokio::task::spawn_blocking;
 use tracing::{error, info};
@@ -29,11 +32,11 @@ impl TransactionHandler for BinderObject {
                 continue;
             }
             match transaction.payload.next_object_type() {
-                Some(BinderObjectType::PortHandle)
-                | Some(BinderObjectType::WeakPortHandle)
-                | Some(BinderObjectType::WeakOwnedPort)
-                | Some(BinderObjectType::OwnedPort) => {
-                    builder.push_port(&transaction.payload.read_port().unwrap());
+                Some(BinderObjectType::BinderRef)
+                | Some(BinderObjectType::WeakBinderRef)
+                | Some(BinderObjectType::WeakBinderObject)
+                | Some(BinderObjectType::BinderObject) => {
+                    builder.push_binder_ref(&transaction.payload.read_binder_ref().unwrap());
                     continue;
                 }
                 Some(BinderObjectType::Fd) => {

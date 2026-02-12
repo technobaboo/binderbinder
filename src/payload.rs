@@ -8,10 +8,10 @@ use std::{
 };
 
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::error;
 
 use crate::{
-    binder_ports::{BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef},
+    binder_object::{BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef},
     sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
         BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
@@ -37,11 +37,9 @@ impl<'a> PayloadBuilder<'a> {
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
     }
-    pub fn push_port(&mut self, port: &BinderObjectOrRef) {
+    pub fn push_binder_ref(&mut self, port: &BinderObjectOrRef) {
         self.align(align_of::<FlatBinderObject>());
         let flat_obj = port.get_flat_binder_object();
-        debug!("pushing port: {port:?}");
-        debug!("pushing port obj: {flat_obj:?}");
         self.obj_offsets.push(self.data.len());
         let slice = unsafe {
             slice::from_raw_parts(
@@ -53,7 +51,6 @@ impl<'a> PayloadBuilder<'a> {
     }
     pub fn push_fd<'fd: 'a>(&mut self, fd: BorrowedFd<'fd>, cookie: usize) {
         self.align(align_of::<BinderFdObject>());
-        debug!("pushing fd: {}", fd.as_raw_fd());
         let fd_obj = BinderFdObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::FD,
@@ -70,7 +67,6 @@ impl<'a> PayloadBuilder<'a> {
     }
     pub fn push_owned_fd(&mut self, fd: OwnedFd, cookie: usize) {
         self.align(align_of::<BinderFdObject>());
-        debug!("pushing fd: {}", fd.as_raw_fd());
         let fd_obj = BinderFdObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::FD,
@@ -235,7 +231,7 @@ impl PayloadReader {
             Err(PayloadBytesReadError::OutOfBounds)
         }
     }
-    pub fn read_port(&mut self) -> Result<BinderObjectOrRef, PayloadPortReadError> {
+    pub fn read_binder_ref(&mut self) -> Result<BinderObjectOrRef, PayloadPortReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
 
@@ -258,7 +254,7 @@ impl PayloadReader {
         let flat_bytes = &data[offset..offset + size_of::<FlatBinderObject>()];
         let flat_obj =
             unsafe { ptr::read_unaligned(flat_bytes.as_ptr() as *const FlatBinderObject) };
-        let port = match flat_obj.hdr.type_ {
+        let object_or_ref = match flat_obj.hdr.type_ {
             BinderType::BINDER => BinderObjectOrRef::Object(
                 self.device
                     .owned_ports
@@ -285,10 +281,9 @@ impl PayloadReader {
             ),
             _ => unreachable!("if this is ever reached, horrible things have happened"),
         };
-        debug!("received object: {port:?}");
         self.next_offset_index += 1;
         self.next_data_index = offset + size_of::<FlatBinderObject>();
-        Ok(port)
+        Ok(object_or_ref)
     }
     pub fn read_fd(&mut self) -> Result<(OwnedFd, usize), PayloadObjectReadError> {
         let offsets = self.offsets.as_mut();
@@ -307,7 +302,6 @@ impl PayloadReader {
         let fd_bytes = &data[offset..offset + size_of::<BinderFdObject>()];
         let fd_obj = unsafe { ptr::read_unaligned(fd_bytes.as_ptr() as *const BinderFdObject) };
         let fd = unsafe { OwnedFd::from_raw_fd(fd_obj.data.fd) };
-        info!("received fd: {}", fd.as_raw_fd());
         self.next_offset_index += 1;
         self.next_data_index = offset + size_of::<BinderFdObject>();
         Ok((fd, fd_obj.cookie))
@@ -321,10 +315,10 @@ impl PayloadReader {
         let header =
             unsafe { ptr::read_unaligned(header_bytes.as_ptr() as *const BinderObjectHeader) };
         Some(match header.type_ {
-            BinderType::BINDER => BinderObjectType::OwnedPort,
-            BinderType::HANDLE => BinderObjectType::PortHandle,
-            BinderType::WEAK_BINDER => BinderObjectType::WeakOwnedPort,
-            BinderType::WEAK_HANDLE => BinderObjectType::WeakPortHandle,
+            BinderType::BINDER => BinderObjectType::BinderObject,
+            BinderType::HANDLE => BinderObjectType::BinderRef,
+            BinderType::WEAK_BINDER => BinderObjectType::WeakBinderObject,
+            BinderType::WEAK_HANDLE => BinderObjectType::WeakBinderRef,
             BinderType::FD => BinderObjectType::Fd,
             BinderType::FDA => BinderObjectType::FdArray,
             BinderType::PTR => BinderObjectType::Buffer,
@@ -344,10 +338,10 @@ impl PayloadReader {
     // TODO: figure out how to do buffers, child buffers and fd arrays
 }
 pub enum BinderObjectType {
-    OwnedPort,
-    WeakOwnedPort,
-    PortHandle,
-    WeakPortHandle,
+    BinderObject,
+    WeakBinderObject,
+    BinderRef,
+    WeakBinderRef,
     Fd,
     FdArray,
     Buffer,
@@ -400,10 +394,10 @@ impl PayloadReader {
                 }
             };
             match binder_type {
-                BinderObjectType::OwnedPort
-                | BinderObjectType::WeakOwnedPort
-                | BinderObjectType::PortHandle
-                | BinderObjectType::WeakPortHandle => unreachable!(),
+                BinderObjectType::BinderObject
+                | BinderObjectType::WeakBinderObject
+                | BinderObjectType::BinderRef
+                | BinderObjectType::WeakBinderRef => unreachable!(),
                 BinderObjectType::Fd => {
                     let fd_bytes = &mut main_data[*offset..offset + size_of::<BinderFdObject>()];
                     let fd_obj = fd_bytes.as_mut_ptr() as *mut BinderFdObject;
