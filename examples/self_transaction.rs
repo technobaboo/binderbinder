@@ -1,5 +1,5 @@
 use binderbinder::{
-    binder_object::{BinderObjectOrRef, BinderRef},
+    binder_object::ContextManagerBinderRef,
     device::Transaction,
     payload::{BinderObjectType, PayloadBuilder},
     BinderDevice, TransactionHandler,
@@ -75,11 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transaction_future = spawn_blocking(move || {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self");
-        device.transact_blocking(
-            &BinderObjectOrRef::Ref(BinderRef::get_context_manager_handle(&device)),
-            ECHO_CODE,
-            payload,
-        )
+        device.transact_blocking(&ContextManagerBinderRef, ECHO_CODE, payload)
     });
     match transaction_future.await.unwrap() {
         Ok((_, mut reply)) => {
