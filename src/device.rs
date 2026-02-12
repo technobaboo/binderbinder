@@ -11,7 +11,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use std::ffi::c_void;
-use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -72,7 +72,6 @@ impl BinderDevice {
     /// Create a new BinderDevice from an already-open fd.
     pub fn from_fd(fd: impl Into<OwnedFd>) -> Arc<Self> {
         let fd = Arc::new(fd.into());
-        debug!("dev fd: {}", fd.as_raw_fd());
         let backing = BinderBackingMemMap::new(fd.as_fd(), 1024 * 1024);
         let started = Arc::new(AtomicBool::new(false));
         let dev = Arc::new_cyclic(|weak| {
@@ -225,7 +224,7 @@ impl BinderDevice {
         });
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let mut write_data = Some(bytes.as_slice());
-        let v = loop {
+        loop {
             let v = unsafe {
                 binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), &runtime)
             };
@@ -249,9 +248,7 @@ impl BinderDevice {
                 }
                 None => continue,
             }
-        };
-        info!(fds=?data.fds());
-        v
+        }
     }
 }
 #[derive(Debug)]
@@ -279,7 +276,6 @@ impl BinderBackingMemMap {
 }
 impl Drop for BinderBackingMemMap {
     fn drop(&mut self) {
-        warn!("backing mem dropped");
         unsafe {
             munmap(self.ptr, self.len).unwrap();
         }
@@ -382,7 +378,6 @@ unsafe fn binder_write_read(
     let mut consumed = 0;
     while consumed != binder_wr.read_consumed {
         let read_slice = &read_data[consumed..binder_wr.read_consumed as usize];
-        debug!("got: {:x?}", read_slice);
         let header = size_of::<u32>();
         let ret = BinderReturn::from_u32(unsafe {
             read_from_slice(&read_slice[..header], &mut consumed)
@@ -493,7 +488,7 @@ unsafe fn binder_write_read(
             }
             // TODO: implement
             BinderReturn::TRANSACTION_COMPLETE => {
-                debug!("transaction complete");
+                trace!("transaction complete");
             }
             BinderReturn::INCREFS => {
                 let v = unsafe {
@@ -605,9 +600,6 @@ enum WriteReadError {
 unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
     assert!(slice.len() >= size_of::<T>());
     *consumed += size_of::<T>();
-    if slice.len() != size_of::<T>() {
-        warn!("slice size doesn't match T size");
-    }
     ptr::read_unaligned(slice.as_ptr().cast())
 }
 

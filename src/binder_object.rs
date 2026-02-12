@@ -3,7 +3,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     device::DynTransactionHandler,
@@ -67,7 +67,7 @@ impl BinderRef {
         if let Some(handle) = handle {
             Some(handle)
         } else {
-            warn!("Failed to find exising weak handle, proper downgrade unimplemented, returning None");
+            warn!("Failed to find exising weak handle");
             None
         }
     }
@@ -77,14 +77,11 @@ impl BinderRef {
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
         if let Some(port) = device.port_handles.get(&handle).and_then(|v| v.upgrade()) {
-            // TODO: dedup kernel strong ref
-            warn!("dedupped BinderPortHandle, proper kernel ref deduping currently unimplemented, leaking strong refs");
             return port;
         }
         unsafe {
-            info!("increasing ref counts?");
-            device.write_binder_struct_command(BinderCommand::ACQUIRE, &handle);
             device.write_binder_struct_command(BinderCommand::INCREFS, &handle);
+            device.write_binder_struct_command(BinderCommand::ACQUIRE, &handle);
         }
         let port = Arc::new(Self {
             device: device.clone(),
@@ -107,6 +104,16 @@ impl BinderRef {
         }
     }
 }
+impl Drop for BinderRef {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .write_binder_struct_command(BinderCommand::DECREFS, &self.handle());
+            self.device
+                .write_binder_struct_command(BinderCommand::RELEASE, &self.handle());
+        }
+    }
+}
 
 impl WeakBinderRef {
     pub fn upgrade(&self) -> Option<Arc<BinderRef>> {
@@ -118,7 +125,7 @@ impl WeakBinderRef {
         if let Some(handle) = handle {
             Some(handle)
         } else {
-            warn!("Failed to find exising strong handle, proper upgrade unimplemented, returning None");
+            warn!("Failed to find exising strong handle");
             None
         }
     }
@@ -132,14 +139,10 @@ impl WeakBinderRef {
             .get(&handle)
             .and_then(|v| v.upgrade())
         {
-            // TODO: dedup kernel strong ref
-            warn!("dedupped BinderPortHandle, proper kernel ref deduping currently unimplemented, leaking strong refs");
             return port;
         }
         unsafe {
-            info!("increasing ref counts?");
             device.write_binder_struct_command(BinderCommand::INCREFS, &handle);
-            device.write_binder_struct_command(BinderCommand::ACQUIRE, &handle);
         }
         let port = Arc::new(Self {
             device: device.clone(),
@@ -161,6 +164,14 @@ impl WeakBinderRef {
             data: FlatBinderObjectData { handle: self.id },
             // ignored for non local ports
             cookie: 0,
+        }
+    }
+}
+impl Drop for WeakBinderRef {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .write_binder_struct_command(BinderCommand::DECREFS, &self.handle());
         }
     }
 }
