@@ -183,9 +183,6 @@ impl<'a> PayloadBuilder<'a> {
     pub(crate) fn offset_buffer_len(&self) -> usize {
         self.obj_offsets.len()
     }
-    pub(crate) fn fds(&self) -> &[OwnedFd] {
-        &self.owned_fds
-    }
 }
 
 enum PayloadReaderBuffer<T: Sized + 'static> {
