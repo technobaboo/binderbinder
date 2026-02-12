@@ -8,10 +8,12 @@
 
 use core::slice;
 use rustix::fs::{Mode, OFlags};
-use rustix::io::{self};
+use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rustix::process;
 use std::ffi::c_void;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::ops::Deref;
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,14 +24,14 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::binder_ports::{
-    BinderPort, BinderPortHandle, OwnedBinderPort, OwnedBinderPortId, WeakBinderPortHandle,
+    BinderObject, BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderRef,
 };
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
 use crate::sys::{
-    BinderCommand, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn, BinderSizeT,
-    BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT, BinderWriteRead,
-    SetContextMGR, TransactionFlags, TransactionTarget,
+    BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn,
+    BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT,
+    BinderWriteRead, SetContextMGR, SetMaxThreads, TransactionFlags, TransactionTarget,
 };
 use dashmap::DashMap;
 
@@ -39,18 +41,28 @@ pub struct Transaction {
 }
 
 /// Shared binder device state.
+#[derive(Debug)]
 pub struct BinderDevice {
-    fd: Arc<OwnedFd>,
+    fd: Arc<OwnedFdWrapper>,
     pub(crate) cookie_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) owned_ports: Arc<DashMap<OwnedBinderPortId, Arc<OwnedBinderPort>>>,
-    pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderPortHandle>>>,
-    pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderPortHandle>>>,
+    pub(crate) owned_ports: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
+    pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderRef>>>,
+    pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
     // needed for safety
     _backing: BinderBackingMemMap,
 }
 
 impl BinderDevice {
+    pub unsafe fn get_last_error(&self) -> BinderExtendedError {
+        let mut error = BinderExtendedError {
+            id: 0,
+            command: 0,
+            param: 0,
+        };
+        unsafe { rustix::ioctl::ioctl(self.fd.as_fd(), &mut error) }.unwrap();
+        error
+    }
     pub fn new(path: impl AsRef<Path>) -> rustix::io::Result<Arc<Self>> {
         let fd = rustix::fs::open(
             path.as_ref(),
@@ -61,8 +73,9 @@ impl BinderDevice {
     }
     /// Create a new BinderDevice from an already-open fd.
     pub fn from_fd(fd: impl Into<OwnedFd>) -> Arc<Self> {
-        let fd = Arc::new(fd.into());
-        let backing = BinderBackingMemMap::new(&fd, 1024 * 1024);
+        let fd = Arc::new(OwnedFdWrapper(fd.into()));
+        debug!("dev fd: {}", fd.as_raw_fd());
+        let backing = BinderBackingMemMap::new(fd.as_fd(), 1024 * 1024);
         let started = Arc::new(AtomicBool::new(false));
         let dev = Arc::new_cyclic(|weak| {
             let loopers = (0..5)
@@ -94,12 +107,15 @@ impl BinderDevice {
                 _backing: backing,
             }
         });
+        unsafe {
+            rustix::ioctl::ioctl(dev.fd.as_fd(), SetMaxThreads(5)).unwrap();
+        }
         started.store(true, Ordering::Relaxed);
         dev
     }
 
-    pub fn context_manager_handle(self: &Arc<Self>) -> Arc<BinderPortHandle> {
-        BinderPortHandle::get_context_manager_handle(&self)
+    pub fn context_manager_handle(self: &Arc<Self>) -> Arc<BinderRef> {
+        BinderRef::get_context_manager_handle(&self)
     }
 
     /// Register a handler for incoming transactions and return a binder object.
@@ -109,11 +125,11 @@ impl BinderDevice {
     pub fn register_object<T: TransactionHandler>(
         self: &Arc<Self>,
         handler: T,
-    ) -> Arc<OwnedBinderPort> {
+    ) -> Arc<BinderObject> {
         let cookie = self.cookie_counter.fetch_add(1, Ordering::Relaxed);
 
         let handler = Box::new(handler);
-        let port = OwnedBinderPort::new(cookie, handler, self.clone());
+        let port = BinderObject::new(cookie, handler, self.clone());
 
         self.owned_ports.insert(*port.id(), port.clone());
 
@@ -125,31 +141,72 @@ impl BinderDevice {
     // TODO: make this work with weak handles
     pub fn transact_blocking<'a>(
         self: &Arc<Self>,
-        target: &BinderPort,
+        target: &BinderObjectOrRef,
         code: u32,
         data: PayloadBuilder<'_>,
     ) -> Result<(u32, PayloadReader)> {
-        info!("transact_blocking");
+        let runtime = tokio::runtime::Handle::current();
+        match target {
+            BinderObjectOrRef::Object(binder_object) => {
+                self.self_transact_blocking(binder_object.id(), code, data, &runtime)
+            }
+            BinderObjectOrRef::WeakObject(weak_binder_object) => {
+                self.self_transact_blocking(weak_binder_object.id(), code, data, &runtime)
+            }
+            BinderObjectOrRef::Ref(binder_ref) => {
+                self.remote_transact_blocking(binder_ref.handle(), code, data, &runtime)
+            }
+            BinderObjectOrRef::WeakRef(weak_binder_ref) => {
+                self.remote_transact_blocking(weak_binder_ref.handle(), code, data, &runtime)
+            }
+        }
+    }
+    pub async fn set_context_manager(&self, handler: &BinderObject) -> Result<()> {
+        let buf = SetContextMGR(handler.get_flat_binder_object());
+
+        let res = unsafe { rustix::ioctl::ioctl(self.fd.as_fd(), buf) };
+        if let Err(e) = &res {
+            error!("set_context_manager error: {:?}", e);
+        }
+        // TODO: find more accurate error, also this probably doesn't actually return an error
+        res.map_err(|_| Error::PermissionDenied)
+    }
+
+    pub(crate) fn remove_binder_port(&self, id: &BinderObjectId) {
+        self.owned_ports.remove(&id);
+    }
+    pub(crate) unsafe fn write_binder_command(&self, data: &[u8]) {
+        write_binder_command(self.fd.as_fd(), data).unwrap()
+    }
+    pub(crate) unsafe fn write_binder_struct_command<T>(&self, command: BinderCommand, data: &T) {
+        write_binder_struct_command(self.fd.as_fd(), command, data).unwrap()
+    }
+}
+impl BinderDevice {
+    fn self_transact_blocking(
+        self: &Arc<Self>,
+        id: &BinderObjectId,
+        code: u32,
+        data: PayloadBuilder<'_>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(u32, PayloadReader)> {
+        let obj = self.owned_ports.get(id).ok_or(Error::ObjectNotFound)?;
+        let handler = obj.handler();
+        let payload = PayloadReader::from_builder(self.clone(), &data);
+        let reply = runtime.block_on(handler.handle(Transaction { code, payload }));
+        let reply_reader = PayloadReader::from_builder(self.clone(), &reply);
+        Ok((code, reply_reader))
+    }
+    fn remote_transact_blocking<'a>(
+        self: &Arc<Self>,
+        handle: u32,
+        code: u32,
+        data: PayloadBuilder<'_>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(u32, PayloadReader)> {
         let reply = BinderTransactionData {
-            target: match target {
-                BinderPort::Owned(target) => TransactionTarget {
-                    binder: target.id().id,
-                },
-                BinderPort::Handle(target) => TransactionTarget {
-                    handle: target.handle(),
-                },
-                BinderPort::WeakHandle(target) => TransactionTarget {
-                    handle: target.handle(),
-                },
-                BinderPort::WeakOwned(target) => TransactionTarget {
-                    binder: target.id().id,
-                },
-            },
-            cookie: match target {
-                BinderPort::Owned(target) => target.id().cookie,
-                BinderPort::Handle(_) | BinderPort::WeakHandle(_) => 0,
-                BinderPort::WeakOwned(target) => target.id().cookie,
-            },
+            target: TransactionTarget { handle },
+            cookie: 0,
             code,
             // TODO: actually expose some of these in a reasonable way
             flags: TransactionFlags::ACCEPT_FDS,
@@ -163,16 +220,14 @@ impl BinderDevice {
             },
         };
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
         bytes.extend_from_slice(&BinderCommand::TRANSACTION.as_u32().to_ne_bytes());
-        // while bytes.len() % size_of_val(&reply) != 0 {
-        //     bytes.push(0);
-        // }
         bytes.extend_from_slice(unsafe {
             slice::from_raw_parts(&raw const reply as _, size_of_val(&reply))
         });
-        let runtime = tokio::runtime::Handle::current();
+        bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let mut write_data = Some(bytes.as_slice());
-        loop {
+        let v = loop {
             let v = unsafe {
                 binder_write_read(
                     self.fd.as_fd(),
@@ -188,26 +243,12 @@ impl BinderDevice {
                     break Err(Error::Shutdown);
                 }
             }
-        }
-    }
-    pub async fn set_context_manager(&self, handler: &OwnedBinderPort) -> Result<()> {
-        let buf = SetContextMGR(handler.get_flat_binder_object());
-
-        let res = unsafe { rustix::ioctl::ioctl(&self.fd, buf) };
-        if let Err(e) = &res {
-            error!("set_context_manager error: {:?}", e);
-        }
-        // TODO: find more accurate error, also this probably doesn't actually return an error
-        res.map_err(|_| Error::PermissionDenied)
-    }
-
-    pub(crate) fn remove_binder_port(&self, id: &OwnedBinderPortId) {
-        self.owned_ports.remove(&id);
-    }
-    pub(crate) unsafe fn write_binder_command(&self, data: &[u8]) {
-        write_binder_command(self.fd.as_fd(), data).unwrap()
+        };
+        info!(fds=?data.fds());
+        v
     }
 }
+#[derive(Debug)]
 struct BinderBackingMemMap {
     ptr: *mut c_void,
     len: usize,
@@ -232,12 +273,34 @@ impl BinderBackingMemMap {
 }
 impl Drop for BinderBackingMemMap {
     fn drop(&mut self) {
+        warn!("backing mem dropped");
         unsafe {
             munmap(self.ptr, self.len).unwrap();
         }
     }
 }
 
+unsafe fn write_binder_struct_command<T>(
+    fd: BorrowedFd,
+    command: BinderCommand,
+    data: &T,
+) -> rustix::io::Result<()> {
+    let mut bytes = Vec::with_capacity(size_of_val(&command) + size_of_val(data));
+    bytes.extend_from_slice(&command.as_u32().to_ne_bytes());
+    bytes.extend_from_slice(slice::from_raw_parts(
+        data as *const _ as *const u8,
+        size_of_val(data),
+    ));
+    let mut binder_wr = BinderWriteRead {
+        write_size: bytes.len() as BinderSizeT,
+        write_consumed: 0,
+        write_buffer: bytes.as_ptr() as BinderUintptrT,
+        read_size: 0,
+        read_consumed: 0,
+        read_buffer: 0,
+    };
+    io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd, &mut binder_wr) })
+}
 unsafe fn write_binder_command(fd: BorrowedFd, data: &[u8]) -> rustix::io::Result<()> {
     let mut binder_wr = BinderWriteRead {
         write_size: data.len() as BinderSizeT,
@@ -250,9 +313,28 @@ unsafe fn write_binder_command(fd: BorrowedFd, data: &[u8]) -> rustix::io::Resul
     io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd, &mut binder_wr) })
 }
 
-fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>) {
+#[derive(Debug)]
+struct OwnedFdWrapper(OwnedFd);
+impl Deref for OwnedFdWrapper {
+    type Target = OwnedFd;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for OwnedFdWrapper {
+    fn drop(&mut self) {
+        warn!("dev fd dropped somehow")
+    }
+}
+
+fn looper(
+    runtime: &tokio::runtime::Handle,
+    device: Weak<BinderDevice>,
+    dev_fd: Arc<OwnedFdWrapper>,
+) {
     let mut init_data = Vec::new();
-    init_data.extend_from_slice(&BinderCommand::REGISTER_LOOPER.as_u32().to_ne_bytes());
+    // init_data.extend_from_slice(&BinderCommand::REGISTER_LOOPER.as_u32().to_ne_bytes());
     init_data.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
     let mut init_data = Some(init_data.as_slice());
     loop {
@@ -291,13 +373,18 @@ unsafe fn binder_write_read(
         read_consumed: 0,
         read_buffer: read_data.as_mut_ptr() as BinderUintptrT,
     };
-    if write_data.is_some() {
-        info!(?binder_wr);
-    }
+    // if write_data.is_some() {
+    //     info!(?binder_wr);
+    // }
     // info!(v = write_data.is_some());
     let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(&dev_fd, &mut binder_wr) });
     if let Err(err) = res {
         error!("binder write_read call failed: {err}");
+        if err.raw_os_error() == 9 {
+            info!("fd: {}", dev_fd.as_raw_fd());
+            std::process::exit(1);
+            panic!("a");
+        }
         return Err(WriteReadError::NotReply);
     }
     let Some(device) = device.upgrade() else {
@@ -307,7 +394,7 @@ unsafe fn binder_write_read(
     // let read_slice = &read_data[0..binder_wr.read_consumed as usize];
     while consumed != binder_wr.read_consumed {
         let read_slice = &read_data[consumed..binder_wr.read_consumed as usize];
-        // debug!("got: {:x?}", read_slice);
+        debug!("got: {:x?}", read_slice);
         let header = size_of::<u32>();
         let ret = BinderReturn::from_u32(unsafe {
             read_from_slice(&read_slice[..header], &mut consumed)
@@ -339,7 +426,7 @@ unsafe fn binder_write_read(
                     })
                 };
                 // Safety: incomming transactions will always use the local identifier
-                let target = OwnedBinderPortId::from_raw(
+                let target = BinderObjectId::from_raw(
                     unsafe { transaction.target.binder },
                     transaction.cookie,
                 );
@@ -348,7 +435,7 @@ unsafe fn binder_write_read(
                     return Err(WriteReadError::NotReply);
                 };
                 let payload_reader = unsafe {
-                    PayloadReader::from_raw(
+                    PayloadReader::from_kernel_raw(
                         device.clone(),
                         transaction.data.buffer as *const u8,
                         transaction.data_size,
@@ -362,7 +449,7 @@ unsafe fn binder_write_read(
                         payload: payload_reader,
                     }));
                 } else {
-                    let reply = runtime.block_on(handler.handler().handle(Transaction {
+                    let reply_data = runtime.block_on(handler.handler().handle(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
                     }));
@@ -376,12 +463,12 @@ unsafe fn binder_write_read(
                         flags: transaction.flags,
                         sender_pid: rustix::process::getpid().as_raw_pid(),
                         sender_euid: rustix::process::getuid().as_raw(),
-                        data_size: reply.data_buffer_len() as BinderSizeT,
-                        offsets_size: (reply.offset_buffer_len() * size_of::<usize>())
+                        data_size: reply_data.data_buffer_len() as BinderSizeT,
+                        offsets_size: (reply_data.offset_buffer_len() * size_of::<usize>())
                             as BinderSizeT,
                         data: crate::sys::BinderTransactionDataPtrs {
-                            buffer: reply.data_buffer_ptr() as _,
-                            offsets: reply.offset_buffer_ptr() as _,
+                            buffer: reply_data.data_buffer_ptr() as _,
+                            offsets: reply_data.offset_buffer_ptr() as _,
                         },
                     };
                     let mut bytes = Vec::new();
@@ -391,8 +478,9 @@ unsafe fn binder_write_read(
                         size_of_val(&reply),
                     ));
                     write_binder_command(dev_fd, &bytes).unwrap();
+                    drop(reply_data);
                 }
-                info!("transaction?");
+                // info!("transaction?");
             }
             BinderReturn::REPLY => {
                 let reply = unsafe {
@@ -400,7 +488,7 @@ unsafe fn binder_write_read(
                 };
                 info!("reply?");
                 return Ok((reply.code, unsafe {
-                    PayloadReader::from_raw(
+                    PayloadReader::from_kernel_raw(
                         device.clone(),
                         reply.data.buffer as *const u8,
                         reply.data_size,
@@ -423,12 +511,16 @@ unsafe fn binder_write_read(
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
+                _ = write_binder_struct_command(dev_fd, BinderCommand::INCREFS_DONE, &v)
+                    .inspect_err(|err| error!("failed to send INCREFS_DONE: {err}"));
                 info!("weak ref increase");
             }
             BinderReturn::ACQUIRE => {
                 let v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
+                _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &v)
+                    .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
                 info!("strong ref increase");
             }
             BinderReturn::RELEASE => {
@@ -471,7 +563,8 @@ unsafe fn binder_write_read(
                 info!("clear death notif");
             }
             BinderReturn::FAILED_REPLY => {
-                info!("failed reply");
+                info!("failed reply: {:?}", unsafe { device.get_last_error() });
+                return Err(WriteReadError::NoDevice);
             }
             BinderReturn::FROZEN_REPLY => {
                 info!("frozen reply");

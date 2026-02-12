@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Formatter};
 use std::os::fd::RawFd;
 
 use bitflags::bitflags;
@@ -9,19 +10,23 @@ use rustix::process::{RawPid, RawUid};
 pub type BinderSizeT = usize;
 pub type BinderUintptrT = usize;
 
+const fn b_pack_chars(c1: u8, c2: u8, c3: u8, c4: u8) -> u32 {
+    ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
+}
+const B_TYPE_LARGE: u8 = 0x85;
 /// TODO: value names in debug impl
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct BinderType(u32);
 impl BinderType {
-    pub const BINDER: Self = Self(0x17);
-    pub const WEAK_BINDER: Self = Self(0x18);
-    pub const HANDLE: Self = Self(0x19);
-    pub const WEAK_HANDLE: Self = Self(0x1a);
-    pub const FD: Self = Self(0x1b);
+    pub const BINDER: Self = Self(b_pack_chars(b's', b'b', b'*', B_TYPE_LARGE));
+    pub const WEAK_BINDER: Self = Self(b_pack_chars(b'w', b'b', b'*', B_TYPE_LARGE));
+    pub const HANDLE: Self = Self(b_pack_chars(b's', b'h', b'*', B_TYPE_LARGE));
+    pub const WEAK_HANDLE: Self = Self(b_pack_chars(b'w', b'h', b'*', B_TYPE_LARGE));
+    pub const FD: Self = Self(b_pack_chars(b'f', b'd', b'*', B_TYPE_LARGE));
     /// Fd array
-    pub const FDA: Self = Self(0x1c);
-    pub const PTR: Self = Self(0x1d);
+    pub const FDA: Self = Self(b_pack_chars(b'f', b'd', b'a', B_TYPE_LARGE));
+    pub const PTR: Self = Self(b_pack_chars(b'p', b't', b'*', B_TYPE_LARGE));
 }
 
 bitflags! {
@@ -128,10 +133,13 @@ impl BinderReturn {
     }
 }
 
-// pub const BINDER_VERSION: u32 = 0x40046209;
-// pub const BINDER_SET_CONTEXT_MGR: u32 = 0x40046207;
-// pub const BINDER_SET_MAX_THREADS: u32 = 0x4004620c;
-// pub const BINDER_WRITE_READ: u32 = 0xc0306201;
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BinderExtendedError {
+    pub id: u32,
+    pub command: u32,
+    pub param: i32,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -156,8 +164,8 @@ pub struct FlatBinderObject {
     pub cookie: BinderUintptrT,
 }
 
-impl std::fmt::Debug for FlatBinderObject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for FlatBinderObject {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlatBinderObject")
             .field("hdr", &self.hdr)
             .field("flags", &self.flags)
@@ -180,12 +188,27 @@ impl std::fmt::Debug for FlatBinderObject {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub union BinderFdObjectData {
+    pub pad_binder: BinderUintptrT,
+    pub fd: RawFd,
+}
+
+impl Debug for BinderFdObjectData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderFdObjectData")
+            // Safety: fd is always valid data and the other variant is only used for padding
+            .field("fd", &unsafe { self.fd })
+            .finish()
+    }
+}
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BinderFdObject {
     pub hdr: BinderObjectHeader,
     pub pad_flags: u32,
-    pub pad_binder: BinderUintptrT,
-    pub fd: RawFd,
+    /// in the uapi this is flattened
+    pub data: BinderFdObjectData,
     pub cookie: BinderUintptrT,
 }
 
@@ -255,8 +278,8 @@ pub struct BinderTransactionData {
     pub data: BinderTransactionDataPtrs,
 }
 
-impl std::fmt::Debug for BinderTransactionData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for BinderTransactionData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BinderTransactionData")
             .field("cookie", &self.cookie)
             .field("code", &self.code)
@@ -435,6 +458,50 @@ unsafe impl Ioctl for SetContextMGR {
 
     fn as_ptr(&mut self) -> *mut rustix::ffi::c_void {
         self as *mut _ as *mut _
+    }
+
+    unsafe fn output_from_ptr(
+        _out: rustix::ioctl::IoctlOutput,
+        _extract_output: *mut rustix::ffi::c_void,
+    ) -> rustix::io::Result<Self::Output> {
+        Ok(())
+    }
+}
+
+#[repr(transparent)]
+pub struct SetMaxThreads(pub u32);
+unsafe impl Ioctl for SetMaxThreads {
+    type Output = ();
+
+    const IS_MUTATING: bool = true;
+
+    fn opcode(&self) -> rustix::ioctl::Opcode {
+        write::<Self>(b'b', 5)
+    }
+
+    fn as_ptr(&mut self) -> *mut rustix::ffi::c_void {
+        self as *mut _ as *mut _
+    }
+
+    unsafe fn output_from_ptr(
+        _out: rustix::ioctl::IoctlOutput,
+        _extract_output: *mut rustix::ffi::c_void,
+    ) -> rustix::io::Result<Self::Output> {
+        Ok(())
+    }
+}
+
+unsafe impl Ioctl for &mut BinderExtendedError {
+    type Output = ();
+
+    const IS_MUTATING: bool = true;
+
+    fn opcode(&self) -> rustix::ioctl::Opcode {
+        read_write::<BinderExtendedError>(b'b', 17)
+    }
+
+    fn as_ptr(&mut self) -> *mut rustix::ffi::c_void {
+        *self as *mut BinderExtendedError as *mut _
     }
 
     unsafe fn output_from_ptr(

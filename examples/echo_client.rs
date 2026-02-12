@@ -1,5 +1,5 @@
 use binderbinder::{
-    binder_ports::{BinderPort, BinderPortHandle},
+    binder_ports::{BinderObjectOrRef, BinderRef},
     payload::PayloadBuilder,
     BinderDevice,
 };
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self echoed by the context manager");
         device.transact_blocking(
-            &BinderPort::Handle(BinderPortHandle::get_context_manager_handle(&device)),
+            &BinderObjectOrRef::Ref(BinderRef::get_context_manager_handle(&device)),
             ECHO_CODE,
             payload,
         )

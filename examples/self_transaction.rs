@@ -1,5 +1,5 @@
 use binderbinder::{
-    BinderDevice, TransactionHandler, binder_ports::{BinderPort, BinderPortHandle}, device::Transaction, payload::{BinderObjectType, PayloadBuilder}
+    BinderDevice, TransactionHandler, binder_ports::{BinderObjectOrRef, BinderRef}, device::Transaction, payload::{BinderObjectType, PayloadBuilder}
 };
 use tokio::task::spawn_blocking;
 use tracing::{error, info};
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self");
         device.transact_blocking(
-            &BinderPort::Handle(BinderPortHandle::get_context_manager_handle(&device)),
+            &BinderObjectOrRef::Ref(BinderRef::get_context_manager_handle(&device)),
             ECHO_CODE,
             payload,
         )

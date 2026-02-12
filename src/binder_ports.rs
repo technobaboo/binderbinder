@@ -1,48 +1,70 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::{
+    fmt::Debug,
+    sync::{atomic::AtomicBool, Arc},
+};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     device::DynTransactionHandler,
     sys::{
-        BinderObjectHeader, BinderType, BinderUintptrT, FlatBinderFlags, FlatBinderObject,
-        FlatBinderObjectData,
+        BinderCommand, BinderObjectHeader, BinderType, BinderUintptrT, FlatBinderFlags,
+        FlatBinderObject, FlatBinderObjectData,
     },
     BinderDevice,
 };
 
+#[derive(Debug)]
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-pub enum BinderPort {
-    Owned(Arc<OwnedBinderPort>),
-    Handle(Arc<BinderPortHandle>),
-    WeakHandle(Arc<WeakBinderPortHandle>),
-    WeakOwned(WeakOwnedBinderPort),
+pub enum BinderObjectOrRef {
+    Object(Arc<BinderObject>),
+    WeakObject(WeakBinderObject),
+    Ref(Arc<BinderRef>),
+    WeakRef(Arc<WeakBinderRef>),
 }
-impl BinderPort {
+impl BinderObjectOrRef {
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         match self {
-            BinderPort::Owned(p) => p.get_flat_binder_object(),
-            BinderPort::Handle(p) => p.get_flat_binder_object(),
-            BinderPort::WeakHandle(p) => p.get_flat_binder_object(),
-            BinderPort::WeakOwned(p) => p.get_flat_binder_object(),
+            BinderObjectOrRef::Object(p) => p.get_flat_binder_object(),
+            BinderObjectOrRef::Ref(p) => p.get_flat_binder_object(),
+            BinderObjectOrRef::WeakRef(p) => p.get_flat_binder_object(),
+            BinderObjectOrRef::WeakObject(p) => p.get_flat_binder_object(),
         }
     }
 }
 
-/// The owned/local side of a [`BinderPort`]
-pub struct BinderPortHandle {
-    device: Arc<BinderDevice>,
-    id: u32,
-    dead: Arc<AtomicBool>,
-}
-/// The owned/local side of a [`BinderPort`]
-pub struct WeakBinderPortHandle {
+/// The owned/local side of a [`BinderObject`]
+pub struct BinderRef {
     device: Arc<BinderDevice>,
     id: u32,
     dead: Arc<AtomicBool>,
 }
 
-impl BinderPortHandle {
+impl Debug for BinderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderRef")
+            .field("id", &self.id)
+            .field("dead", &self.dead)
+            .finish()
+    }
+}
+/// The owned/local side of a [`WeakBinderObject`]
+pub struct WeakBinderRef {
+    device: Arc<BinderDevice>,
+    id: u32,
+    dead: Arc<AtomicBool>,
+}
+
+impl Debug for WeakBinderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakBinderRef")
+            .field("id", &self.id)
+            .field("dead", &self.dead)
+            .finish()
+    }
+}
+
+impl BinderRef {
     pub fn get_context_manager_handle(device: &Arc<BinderDevice>) -> Arc<Self> {
         Self {
             device: device.clone(),
@@ -51,7 +73,7 @@ impl BinderPortHandle {
         }
         .into()
     }
-    pub fn downgrade(&self) -> Option<Arc<WeakBinderPortHandle>> {
+    pub fn downgrade(&self) -> Option<Arc<WeakBinderRef>> {
         let handle = self
             .device
             .weak_port_handles
@@ -73,6 +95,11 @@ impl BinderPortHandle {
             // TODO: dedup kernel strong ref
             warn!("dedupped BinderPortHandle, proper kernel ref deduping currently unimplemented, leaking strong refs");
             return port;
+        }
+        unsafe {
+            info!("increasing ref counts?");
+            device.write_binder_struct_command(BinderCommand::ACQUIRE, &handle);
+            device.write_binder_struct_command(BinderCommand::INCREFS, &handle);
         }
         let port = Arc::new(Self {
             device: device.clone(),
@@ -96,8 +123,8 @@ impl BinderPortHandle {
     }
 }
 
-impl WeakBinderPortHandle {
-    pub fn upgrade(&self) -> Option<Arc<BinderPortHandle>> {
+impl WeakBinderRef {
+    pub fn upgrade(&self) -> Option<Arc<BinderRef>> {
         let handle = self
             .device
             .port_handles
@@ -124,6 +151,11 @@ impl WeakBinderPortHandle {
             warn!("dedupped BinderPortHandle, proper kernel ref deduping currently unimplemented, leaking strong refs");
             return port;
         }
+        unsafe {
+            info!("increasing ref counts?");
+            device.write_binder_struct_command(BinderCommand::INCREFS, &handle);
+            device.write_binder_struct_command(BinderCommand::ACQUIRE, &handle);
+        }
         let port = Arc::new(Self {
             device: device.clone(),
             id: handle,
@@ -148,22 +180,30 @@ impl WeakBinderPortHandle {
     }
 }
 
-/// The id of a owned/local [`BinderPort`]
+/// The id of a [`BinderObject`]
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OwnedBinderPortId {
+pub struct BinderObjectId {
     pub(crate) id: BinderUintptrT,
     pub(crate) cookie: BinderUintptrT,
 }
 
-/// The owned/local side of a [`BinderPort`]
-pub struct OwnedBinderPort {
+/// The owned/local side of a [`BinderRef`]
+pub struct BinderObject {
     device: Arc<BinderDevice>,
-    id: OwnedBinderPortId,
+    id: BinderObjectId,
     handler: Box<dyn DynTransactionHandler>,
 }
 
-impl OwnedBinderPort {
-    pub fn id(&self) -> &OwnedBinderPortId {
+impl Debug for BinderObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderObject")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl BinderObject {
+    pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
     pub(crate) fn handler(&self) -> &dyn DynTransactionHandler {
@@ -176,7 +216,7 @@ impl OwnedBinderPort {
     ) -> Arc<Self> {
         Self {
             device,
-            id: OwnedBinderPortId { id, cookie: 0 },
+            id: BinderObjectId { id, cookie: 0 },
             handler,
         }
         .into()
@@ -195,17 +235,25 @@ impl OwnedBinderPort {
 }
 
 /// Only returned if a remote process sends a [`WeakBinderPortHandle`] to the process owning the [`BinderPort`]
-pub struct WeakOwnedBinderPort {
+pub struct WeakBinderObject {
     // TODO: is this needed?
     device: Arc<BinderDevice>,
-    id: OwnedBinderPortId,
+    id: BinderObjectId,
 }
 
-impl WeakOwnedBinderPort {
-    pub fn id(&self) -> &OwnedBinderPortId {
+impl Debug for WeakBinderObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakBinderObject")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl WeakBinderObject {
+    pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
-    pub(crate) fn from_id(device: Arc<BinderDevice>, id: OwnedBinderPortId) -> Self {
+    pub(crate) fn from_id(device: Arc<BinderDevice>, id: BinderObjectId) -> Self {
         Self { device, id }
     }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
@@ -221,13 +269,13 @@ impl WeakOwnedBinderPort {
     }
 }
 
-impl OwnedBinderPortId {
-    pub(crate) fn from_raw(binder: BinderUintptrT, cookie: BinderUintptrT) -> OwnedBinderPortId {
+impl BinderObjectId {
+    pub(crate) fn from_raw(binder: BinderUintptrT, cookie: BinderUintptrT) -> BinderObjectId {
         Self { id: binder, cookie }
     }
 }
 
-impl Drop for OwnedBinderPort {
+impl Drop for BinderObject {
     fn drop(&mut self) {
         self.device.remove_binder_port(&self.id);
     }

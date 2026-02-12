@@ -1,20 +1,20 @@
 use core::slice;
 use std::{
     marker::PhantomData,
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-    ptr::{self, NonNull},
+    ops::{Deref, Not},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+    ptr::{self},
     sync::Arc,
 };
 
 use thiserror::Error;
+use tracing::{debug, error, info};
 
 use crate::{
-    binder_ports::{
-        BinderPort, BinderPortHandle, OwnedBinderPortId, WeakBinderPortHandle, WeakOwnedBinderPort,
-    },
+    binder_ports::{BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef},
     sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
-        BinderObjectHeader, BinderType, FlatBinderObject,
+        BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
     },
     BinderDevice,
 };
@@ -24,7 +24,6 @@ pub struct PayloadBuilder<'a> {
     buffer_fd_lifetime: PhantomData<&'a ()>,
     owned_fds: Vec<OwnedFd>,
 }
-
 impl<'a> PayloadBuilder<'a> {
     pub fn new() -> Self {
         Self {
@@ -38,9 +37,11 @@ impl<'a> PayloadBuilder<'a> {
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
     }
-    pub fn push_port(&mut self, port: &BinderPort) {
+    pub fn push_port(&mut self, port: &BinderObjectOrRef) {
         self.align(align_of::<FlatBinderObject>());
         let flat_obj = port.get_flat_binder_object();
+        debug!("pushing port: {port:?}");
+        debug!("pushing port obj: {flat_obj:?}");
         self.obj_offsets.push(self.data.len());
         let slice = unsafe {
             slice::from_raw_parts(
@@ -52,13 +53,13 @@ impl<'a> PayloadBuilder<'a> {
     }
     pub fn push_fd<'fd: 'a>(&mut self, fd: BorrowedFd<'fd>, cookie: usize) {
         self.align(align_of::<BinderFdObject>());
+        debug!("pushing fd: {}", fd.as_raw_fd());
         let fd_obj = BinderFdObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::FD,
             },
             pad_flags: 0,
-            pad_binder: 0,
-            fd: fd.as_raw_fd(),
+            data: BinderFdObjectData { fd: fd.as_raw_fd() },
             cookie,
         };
         self.obj_offsets.push(self.data.len());
@@ -69,13 +70,13 @@ impl<'a> PayloadBuilder<'a> {
     }
     pub fn push_owned_fd(&mut self, fd: OwnedFd, cookie: usize) {
         self.align(align_of::<BinderFdObject>());
+        debug!("pushing fd: {}", fd.as_raw_fd());
         let fd_obj = BinderFdObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::FD,
             },
             pad_flags: 0,
-            pad_binder: 0,
-            fd: fd.as_raw_fd(),
+            data: BinderFdObjectData { fd: fd.as_raw_fd() },
             cookie,
         };
         self.obj_offsets.push(self.data.len());
@@ -165,7 +166,7 @@ impl<'a> PayloadBuilder<'a> {
         self.data.extend_from_slice(slice);
     }
     pub fn align(&mut self, align: usize) {
-        while self.data.len() % align != 0 {
+        while (self.data.as_ptr().addr() + self.data.len()) % align != 0 {
             self.data.push(0);
         }
     }
@@ -184,26 +185,41 @@ impl<'a> PayloadBuilder<'a> {
     pub(crate) fn offset_buffer_len(&self) -> usize {
         self.obj_offsets.len()
     }
+    pub(crate) fn fds(&self) -> &[OwnedFd] {
+        &self.owned_fds
+    }
+}
+
+enum PayloadReaderBuffer<T: Sized + 'static> {
+    Owned(Vec<T>),
+    KernelBorrowed(&'static [T]),
+}
+impl<T: Sized + 'static> Deref for PayloadReaderBuffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            PayloadReaderBuffer::Owned(items) => items,
+            PayloadReaderBuffer::KernelBorrowed(items) => items,
+        }
+    }
 }
 
 pub struct PayloadReader {
     device: Arc<BinderDevice>,
-    data_ptr: *const u8,
-    data_len: usize,
-
-    offsets_ptr: Option<NonNull<usize>>,
-    offsets_len: usize,
+    data: PayloadReaderBuffer<u8>,
+    offsets: Option<PayloadReaderBuffer<usize>>,
 
     next_offset_index: usize,
     next_data_index: usize,
 }
 impl PayloadReader {
-    pub fn read_bytes(&mut self, num_bytes: usize) -> Result<&[u8], PayloadBytesReadError> {
-        let offsets = self
-            .offsets_ptr
-            .as_ref()
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), self.offsets_len) });
-        let data = unsafe { slice::from_raw_parts(self.data_ptr, self.data_len) };
+    pub fn read_bytes<'a>(
+        &'a mut self,
+        num_bytes: usize,
+    ) -> Result<&'a [u8], PayloadBytesReadError> {
+        let offsets = self.offsets.as_mut();
+        let data = &mut self.data;
         // this assumes that all offsets are in order
         if !offsets.is_none_or(|v| {
             v.iter()
@@ -219,12 +235,9 @@ impl PayloadReader {
             Err(PayloadBytesReadError::OutOfBounds)
         }
     }
-    pub fn read_port(&mut self) -> Result<BinderPort, PayloadPortReadError> {
-        let offsets = self
-            .offsets_ptr
-            .as_ref()
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), self.offsets_len) });
-        let data = unsafe { slice::from_raw_parts(self.data_ptr, self.data_len) };
+    pub fn read_port(&mut self) -> Result<BinderObjectOrRef, PayloadPortReadError> {
+        let offsets = self.offsets.as_mut();
+        let data = &mut self.data;
 
         let offset = *offsets
             .and_then(|v| v.get(self.next_offset_index))
@@ -246,41 +259,40 @@ impl PayloadReader {
         let flat_obj =
             unsafe { ptr::read_unaligned(flat_bytes.as_ptr() as *const FlatBinderObject) };
         let port = match flat_obj.hdr.type_ {
-            BinderType::BINDER => BinderPort::Owned(
+            BinderType::BINDER => BinderObjectOrRef::Object(
                 self.device
                     .owned_ports
-                    .get(&OwnedBinderPortId::from_raw(
+                    .get(&BinderObjectId::from_raw(
                         unsafe { flat_obj.data.binder },
                         flat_obj.cookie,
                     ))
                     .ok_or(PayloadPortReadError::UnknownOwnedPort)?
                     .clone(),
             ),
-            BinderType::WEAK_BINDER => BinderPort::WeakOwned(WeakOwnedBinderPort::from_id(
+            BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 self.device.clone(),
-                OwnedBinderPortId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
+                BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
             )),
-            BinderType::HANDLE => BinderPort::Handle(BinderPortHandle::get_and_dedup_from_raw(
-                &self.device,
-                unsafe { flat_obj.data.handle },
-            )),
-            BinderType::WEAK_HANDLE => BinderPort::WeakHandle(
-                WeakBinderPortHandle::get_and_dedup_from_raw(&self.device, unsafe {
+            BinderType::HANDLE => {
+                BinderObjectOrRef::Ref(BinderRef::get_and_dedup_from_raw(&self.device, unsafe {
+                    flat_obj.data.handle
+                }))
+            }
+            BinderType::WEAK_HANDLE => BinderObjectOrRef::WeakRef(
+                WeakBinderRef::get_and_dedup_from_raw(&self.device, unsafe {
                     flat_obj.data.handle
                 }),
             ),
             _ => unreachable!("if this is ever reached, horrible things have happened"),
         };
+        debug!("received object: {port:?}");
         self.next_offset_index += 1;
         self.next_data_index = offset + size_of::<FlatBinderObject>();
         Ok(port)
     }
     pub fn read_fd(&mut self) -> Result<(OwnedFd, usize), PayloadObjectReadError> {
-        let offsets = self
-            .offsets_ptr
-            .as_ref()
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), self.offsets_len) });
-        let data = unsafe { slice::from_raw_parts(self.data_ptr, self.data_len) };
+        let offsets = self.offsets.as_mut();
+        let data = &mut self.data;
 
         let offset = *offsets
             .and_then(|v| v.get(self.next_offset_index))
@@ -294,17 +306,15 @@ impl PayloadReader {
 
         let fd_bytes = &data[offset..offset + size_of::<BinderFdObject>()];
         let fd_obj = unsafe { ptr::read_unaligned(fd_bytes.as_ptr() as *const BinderFdObject) };
-        let fd = unsafe { OwnedFd::from_raw_fd(fd_obj.fd) };
+        let fd = unsafe { OwnedFd::from_raw_fd(fd_obj.data.fd) };
+        info!("received fd: {}", fd.as_raw_fd());
         self.next_offset_index += 1;
         self.next_data_index = offset + size_of::<BinderFdObject>();
         Ok((fd, fd_obj.cookie))
     }
     pub fn next_object_type(&self) -> Option<BinderObjectType> {
-        let offsets = self
-            .offsets_ptr
-            .as_ref()
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), self.offsets_len) });
-        let data = unsafe { slice::from_raw_parts(self.data_ptr, self.data_len) };
+        let offsets = self.offsets.as_ref();
+        let data = &self.data;
 
         let offset = *offsets.and_then(|v| v.get(self.next_offset_index))?;
         let header_bytes = &data[offset..offset + size_of::<BinderObjectHeader>()];
@@ -323,11 +333,8 @@ impl PayloadReader {
     }
     /// includes align bytes
     pub fn bytes_until_next_obj(&self) -> usize {
-        let offsets = self
-            .offsets_ptr
-            .as_ref()
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), self.offsets_len) });
-        let data = unsafe { slice::from_raw_parts(self.data_ptr, self.data_len) };
+        let offsets = self.offsets.as_ref();
+        let data = &self.data;
 
         let next_target = offsets
             .and_then(|v| v.iter().find(|v| **v > self.next_data_index).copied())
@@ -349,7 +356,7 @@ pub enum BinderObjectType {
 unsafe impl Send for PayloadReader {}
 unsafe impl Sync for PayloadReader {}
 impl PayloadReader {
-    pub(crate) unsafe fn from_raw(
+    pub(crate) unsafe fn from_kernel_raw(
         device: Arc<BinderDevice>,
         data_ptr: *const u8,
         data_len: usize,
@@ -358,27 +365,88 @@ impl PayloadReader {
     ) -> Self {
         Self {
             device,
-            data_ptr,
-            data_len,
+            data: PayloadReaderBuffer::KernelBorrowed(unsafe {
+                slice::from_raw_parts(data_ptr, data_len)
+            }),
             // not sure why i need to make the ptr mut
-            offsets_ptr: NonNull::new(offsets_ptr as *mut _),
-            offsets_len,
+            offsets: offsets_ptr.is_null().not().then(|| {
+                PayloadReaderBuffer::KernelBorrowed(slice::from_raw_parts(offsets_ptr, offsets_len))
+            }),
             next_offset_index: 0,
             next_data_index: 0,
+        }
+    }
+    pub(crate) fn from_builder(device: Arc<BinderDevice>, builder: &PayloadBuilder) -> Self {
+        let mut main_data = builder.data.clone();
+        let offsets = builder.obj_offsets.clone();
+        for offset in &offsets {
+            let binder_type = {
+                let header_bytes = &main_data[*offset..offset + size_of::<BinderObjectHeader>()];
+                let header = unsafe {
+                    ptr::read_unaligned(header_bytes.as_ptr() as *const BinderObjectHeader)
+                };
+                match header.type_ {
+                    BinderType::BINDER
+                    | BinderType::HANDLE
+                    | BinderType::WEAK_BINDER
+                    | BinderType::WEAK_HANDLE => continue,
+                    BinderType::FD => BinderObjectType::Fd,
+                    BinderType::FDA => todo!(),
+                    BinderType::PTR => todo!(),
+                    v => {
+                        error!("unkown binder type: {v:?}");
+                        continue;
+                    }
+                }
+            };
+            match binder_type {
+                BinderObjectType::OwnedPort
+                | BinderObjectType::WeakOwnedPort
+                | BinderObjectType::PortHandle
+                | BinderObjectType::WeakPortHandle => unreachable!(),
+                BinderObjectType::Fd => {
+                    let fd_bytes = &mut main_data[*offset..offset + size_of::<BinderFdObject>()];
+                    let fd_obj = fd_bytes.as_mut_ptr() as *mut BinderFdObject;
+                    let fd_obj = unsafe { fd_obj.as_mut().unwrap() };
+                    let fd = unsafe { fd_obj.data.fd };
+                    let new_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+                        .try_clone_to_owned()
+                        .unwrap();
+                    fd_obj.data = BinderFdObjectData {
+                        fd: new_fd.into_raw_fd(),
+                    }
+                }
+                BinderObjectType::FdArray => todo!(),
+                BinderObjectType::Buffer => todo!(),
+            }
+        }
+        Self {
+            device,
+            data: PayloadReaderBuffer::Owned(main_data),
+            offsets: Some(PayloadReaderBuffer::Owned(offsets)),
+            next_offset_index: 0,
+            next_data_index: 0,
+        }
+    }
+}
+impl<T: Sized + 'static> PayloadReaderBuffer<T> {
+    unsafe fn free(&mut self, device: &Arc<BinderDevice>) {
+        if let PayloadReaderBuffer::KernelBorrowed(items) = self {
+            // TODO: figure out if this causes mem leaks, should be pretty simple
+            unsafe {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&BinderCommand::FREE_BUFFER.as_u32().to_ne_bytes());
+                bytes.extend_from_slice(&(items.as_ptr() as usize).to_ne_bytes());
+                device.write_binder_command(&bytes);
+            }
         }
     }
 }
 impl Drop for PayloadReader {
     fn drop(&mut self) {
         unsafe {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&BinderCommand::FREE_BUFFER.as_u32().to_ne_bytes());
-            bytes.extend_from_slice(&self.data_ptr.addr().to_ne_bytes());
-            if let Some(addr) = self.offsets_ptr {
-                bytes.extend_from_slice(&BinderCommand::FREE_BUFFER.as_u32().to_ne_bytes());
-                bytes.extend_from_slice(&addr.addr().get().to_ne_bytes());
-            }
-            self.device.write_binder_command(&bytes);
+            self.data.free(&self.device);
+            self.offsets.as_mut().map(|v| v.free(&self.device));
         }
     }
 }
