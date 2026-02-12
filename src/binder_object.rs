@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     device::DynTransactionHandler,
@@ -37,12 +37,13 @@ impl BinderObjectOrRef {
             BinderObjectOrRef::WeakObject(p) => p.get_flat_binder_object(),
         }
     }
+    /// returns true if this is an object, or [`WeakBinderRef::alive`] if this is a ref
     pub fn alive(&self) -> bool {
         match self {
             BinderObjectOrRef::Object(_) => true,
             BinderObjectOrRef::WeakObject(_) => true,
-            BinderObjectOrRef::Ref(p) => !p.dead.load(Ordering::Relaxed),
-            BinderObjectOrRef::WeakRef(p) => !p.dead.load(Ordering::Relaxed),
+            BinderObjectOrRef::Ref(p) => p.alive(),
+            BinderObjectOrRef::WeakRef(p) => p.alive(),
         }
     }
 }
@@ -135,8 +136,8 @@ impl WeakBinderRef {
             }
         }
     }
-    pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Relaxed)
+    pub fn alive(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed)
     }
     pub fn upgrade(&self) -> Option<Arc<BinderRef>> {
         let handle = self
