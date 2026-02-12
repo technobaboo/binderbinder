@@ -328,7 +328,7 @@ pub struct BinderPriorityPtrCookie {
     pub cookie: BinderUintptrT,
 }
 
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BinderHandleCookie {
     pub handle: u32,

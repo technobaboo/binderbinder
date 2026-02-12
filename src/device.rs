@@ -19,17 +19,18 @@ use std::sync::{Arc, Weak};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::binder_object::{
-    BinderObject, BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderRef,
+    BinderObject, BinderObjectId, BinderRef, TransactionTarget, WeakBinderRef,
 };
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
 use crate::sys::{
-    BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn,
+    self, BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn,
     BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT,
-    BinderWriteRead, SetContextMGR, SetMaxThreads, TransactionFlags, TransactionTarget,
+    BinderWriteRead, SetContextMGR, SetMaxThreads, TransactionFlags,
 };
 use dashmap::DashMap;
 
@@ -42,11 +43,13 @@ pub struct Transaction {
 #[derive(Debug)]
 pub struct BinderDevice {
     fd: Arc<OwnedFd>,
-    pub(crate) cookie_counter: AtomicUsize,
+    pub(crate) object_id_counter: AtomicUsize,
+    pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
     pub(crate) owned_ports: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
     pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderRef>>>,
     pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
+    pub(crate) death_notifications: Arc<DashMap<usize, Arc<Notify>>>,
     // needed for safety
     _backing: BinderBackingMemMap,
 }
@@ -96,12 +99,14 @@ impl BinderDevice {
                 .collect();
             Self {
                 fd,
-                cookie_counter: AtomicUsize::new(1),
+                object_id_counter: AtomicUsize::new(1),
+                death_counter: AtomicUsize::new(1),
                 _looper_threads: loopers,
                 owned_ports: Arc::default(),
                 port_handles: Arc::default(),
                 weak_port_handles: Arc::default(),
                 _backing: backing,
+                death_notifications: Arc::default(),
             }
         });
         unsafe {
@@ -109,10 +114,6 @@ impl BinderDevice {
         }
         started.store(true, Ordering::Relaxed);
         dev
-    }
-
-    pub fn context_manager_handle(self: &Arc<Self>) -> Arc<BinderRef> {
-        BinderRef::get_context_manager_handle(&self)
     }
 
     /// Register a handler for incoming transactions and return a binder object.
@@ -123,7 +124,7 @@ impl BinderDevice {
         self: &Arc<Self>,
         handler: T,
     ) -> Arc<BinderObject> {
-        let cookie = self.cookie_counter.fetch_add(1, Ordering::Relaxed);
+        let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
 
         let handler = Box::new(handler);
         let port = BinderObject::new(cookie, handler, self.clone());
@@ -138,23 +139,17 @@ impl BinderDevice {
     // TODO: make this work with weak handles
     pub fn transact_blocking<'a>(
         self: &Arc<Self>,
-        target: &BinderObjectOrRef,
+        target: &dyn TransactionTarget,
         code: u32,
         data: PayloadBuilder<'_>,
     ) -> Result<(u32, PayloadReader)> {
         let runtime = tokio::runtime::Handle::current();
-        match target {
-            BinderObjectOrRef::Object(binder_object) => {
-                self.self_transact_blocking(binder_object.id(), code, data, &runtime)
+        match target.get_transaction_target_handle() {
+            crate::binder_object::TransactionTargetHandle::Local(id) => {
+                self.self_transact_blocking(&id, code, data, &runtime)
             }
-            BinderObjectOrRef::WeakObject(weak_binder_object) => {
-                self.self_transact_blocking(weak_binder_object.id(), code, data, &runtime)
-            }
-            BinderObjectOrRef::Ref(binder_ref) => {
-                self.remote_transact_blocking(binder_ref.handle(), code, data, &runtime)
-            }
-            BinderObjectOrRef::WeakRef(weak_binder_ref) => {
-                self.remote_transact_blocking(weak_binder_ref.handle(), code, data, &runtime)
+            crate::binder_object::TransactionTargetHandle::Remote(handle) => {
+                self.remote_transact_blocking(handle, code, data, &runtime)
             }
         }
     }
@@ -202,7 +197,7 @@ impl BinderDevice {
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
         let reply = BinderTransactionData {
-            target: TransactionTarget { handle },
+            target: sys::TransactionTarget { handle },
             cookie: 0,
             code,
             // TODO: actually expose some of these in a reasonable way
@@ -438,7 +433,7 @@ unsafe fn binder_write_read(
 
                     let reply = BinderTransactionData {
                         // unused in reply
-                        target: TransactionTarget { binder: 0 },
+                        target: sys::TransactionTarget { binder: 0 },
                         // unused in reply
                         cookie: 0,
                         code: transaction.code,
@@ -542,8 +537,12 @@ unsafe fn binder_write_read(
                 let v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                // TODO: impl
-                debug!("dead binder?");
+                if let Some((_, notify)) = device.death_notifications.remove(&v) {
+                    notify.notify_waiters();
+                } else {
+                    warn!("got DeadBinder without having internal death_notification registered for it");
+                }
+                _ = write_binder_struct_command(dev_fd, BinderCommand::DEAD_BINDER_DONE, &v);
             }
             BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
                 let v = unsafe {

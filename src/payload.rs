@@ -265,7 +265,6 @@ impl PayloadReader {
                     .clone(),
             ),
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
-                self.device.clone(),
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
             )),
             BinderType::HANDLE => {
