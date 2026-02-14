@@ -11,15 +11,12 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
-    binder_object::{
-        BinderObjectId, BinderObjectOrRef, BinderRef, UntypedBinderObject, WeakBinderObject,
-        WeakBinderRef,
-    },
-    sys::{
+    BinderDevice, binder_object::{
+        BinderObjectId, BinderObjectOrRef, BinderRef, ToBinderObjectOrRef, UntypedBinderObject, WeakBinderObject, WeakBinderRef
+    }, sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
         BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
-    },
-    BinderDevice,
+    }
 };
 pub struct PayloadBuilder<'a> {
     data: Vec<u8>,
@@ -46,7 +43,8 @@ impl<'a> PayloadBuilder<'a> {
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
     }
-    pub fn push_binder_ref(&mut self, port: &BinderObjectOrRef) {
+    pub fn push_binder_ref(&mut self, binder_ref: &impl ToBinderObjectOrRef) {
+        let port = binder_ref.to_binder_object_or_ref();
         self.align(align_of::<FlatBinderObject>());
         let flat_obj = port.get_flat_binder_object();
         self.obj_offsets.push(self.data.len());

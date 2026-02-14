@@ -368,3 +368,41 @@ impl TransactionTargetImpl for BinderObjectOrRef {
         }
     }
 }
+pub trait ToBinderObjectOrRef: Send + Sync + 'static {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef;
+}
+impl<H: TransactionHandler> ToBinderObjectOrRef for Arc<BinderObject<H>> {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::Object(UntypedBinderObject(self.clone()))
+    }
+}
+impl ToBinderObjectOrRef for WeakBinderObject {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::WeakObject(WeakBinderObject { id: self.id })
+    }
+}
+impl ToBinderObjectOrRef for Arc<BinderRef> {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::Ref(self.clone())
+    }
+}
+impl ToBinderObjectOrRef for Arc<WeakBinderRef> {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::WeakRef(self.clone())
+    }
+}
+impl ToBinderObjectOrRef for UntypedBinderObject {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::Object(self.clone())
+    }
+}
+impl ToBinderObjectOrRef for BinderObjectOrRef {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        match self {
+            BinderObjectOrRef::Object(v) => v.to_binder_object_or_ref(),
+            BinderObjectOrRef::WeakObject(v) => v.to_binder_object_or_ref(),
+            BinderObjectOrRef::Ref(v) => v.to_binder_object_or_ref(),
+            BinderObjectOrRef::WeakRef(v) => v.to_binder_object_or_ref(),
+        }
+    }
+}
