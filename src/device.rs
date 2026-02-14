@@ -10,7 +10,9 @@ use core::slice;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use std::any::Any;
 use std::ffi::c_void;
+use std::fmt::Debug;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
@@ -30,7 +32,7 @@ use crate::payload::{PayloadBuilder, PayloadReader};
 use crate::sys::{
     self, BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn,
     BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT,
-    BinderWriteRead, SetContextMGR, SetMaxThreads, TransactionFlags,
+    BinderWriteRead, FlatBinderObject, SetContextMGR, SetMaxThreads, TransactionFlags,
 };
 use dashmap::DashMap;
 
@@ -46,7 +48,7 @@ pub struct BinderDevice {
     pub(crate) object_id_counter: AtomicUsize,
     pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) objects: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
+    pub(crate) objects: Arc<DashMap<BinderObjectId, Arc<dyn DynBinderObject>>>,
     pub(crate) refs: Arc<DashMap<u32, Weak<BinderRef>>>,
     pub(crate) weak_refs: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
     pub(crate) death_notifications: Arc<DashMap<usize, Arc<Notify>>>,
@@ -125,10 +127,9 @@ impl BinderDevice {
     pub fn register_object<T: TransactionHandler>(
         self: &Arc<Self>,
         handler: T,
-    ) -> Arc<BinderObject> {
+    ) -> Arc<BinderObject<T>> {
         let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
 
-        let handler = Box::new(handler);
         let port = BinderObject::new(cookie, handler, self.clone());
 
         self.objects.insert(*port.id(), port.clone());
@@ -155,7 +156,10 @@ impl BinderDevice {
             }
         }
     }
-    pub async fn set_context_manager(&self, handler: &BinderObject) -> Result<()> {
+    pub async fn set_context_manager<T: TransactionHandler>(
+        &self,
+        handler: &BinderObject<T>,
+    ) -> Result<()> {
         let buf = SetContextMGR(handler.get_flat_binder_object());
 
         let res = unsafe { rustix::ioctl::ioctl(self.fd.as_fd(), buf) };
@@ -184,8 +188,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let obj = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
-        let handler = obj.handler();
+        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction { code, payload }));
         let reply_reader = PayloadReader::from_builder(self.clone(), &reply);
@@ -423,12 +426,12 @@ unsafe fn binder_write_read(
                     )
                 };
                 if transaction.flags.contains(TransactionFlags::ONE_WAY) {
-                    runtime.block_on(handler.handler().handle_one_way(Transaction {
+                    runtime.block_on(handler.handle_one_way(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
                     }));
                 } else {
-                    let reply_data = runtime.block_on(handler.handler().handle(Transaction {
+                    let reply_data = runtime.block_on(handler.handle(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
                     }));
@@ -605,9 +608,12 @@ unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait DynTransactionHandler: Send + Sync + 'static {
+pub(crate) trait DynBinderObject:
+    Any + TransactionTarget + Debug + Send + Sync + 'static
+{
     async fn handle(&self, transaction: Transaction) -> PayloadBuilder;
     async fn handle_one_way(&self, transaction: Transaction);
+    fn get_flat_binder_object(&self) -> FlatBinderObject;
 }
 
 pub trait TransactionHandler: Send + Sync + 'static {
@@ -620,15 +626,4 @@ pub trait TransactionHandler: Send + Sync + 'static {
         &self,
         transaction: Transaction,
     ) -> impl std::future::Future<Output = ()> + std::marker::Send;
-}
-
-#[async_trait::async_trait]
-impl<T: TransactionHandler> DynTransactionHandler for T {
-    async fn handle(&self, transaction: Transaction) -> PayloadBuilder {
-        <Self as TransactionHandler>::handle(&self, transaction).await
-    }
-
-    async fn handle_one_way(&self, transaction: Transaction) {
-        <Self as TransactionHandler>::handle_one_way(&self, transaction).await
-    }
 }

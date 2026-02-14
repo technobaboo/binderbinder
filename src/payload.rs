@@ -12,7 +12,8 @@ use tracing::error;
 
 use crate::{
     binder_object::{
-        BinderObjectId, BinderObjectOrRef, BinderRef, WeakBinderObject, WeakBinderRef,
+        BinderObjectId, BinderObjectOrRef, BinderRef, UntypedBinderObject, WeakBinderObject,
+        WeakBinderRef,
     },
     sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
@@ -215,10 +216,7 @@ pub struct PayloadReader {
     next_data_index: usize,
 }
 impl PayloadReader {
-    pub fn read_bytes(
-        &mut self,
-        num_bytes: usize,
-    ) -> Result<&[u8], PayloadBytesReadError> {
+    pub fn read_bytes(&mut self, num_bytes: usize) -> Result<&[u8], PayloadBytesReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
         // this assumes that all offsets are in order
@@ -260,7 +258,7 @@ impl PayloadReader {
         let flat_obj =
             unsafe { ptr::read_unaligned(flat_bytes.as_ptr() as *const FlatBinderObject) };
         let object_or_ref = match flat_obj.hdr.type_ {
-            BinderType::BINDER => BinderObjectOrRef::Object(
+            BinderType::BINDER => BinderObjectOrRef::Object(UntypedBinderObject(
                 self.device
                     .objects
                     .get(&BinderObjectId::from_raw(
@@ -269,7 +267,7 @@ impl PayloadReader {
                     ))
                     .ok_or(PayloadPortReadError::UnknownOwnedPort)?
                     .clone(),
-            ),
+            )),
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
             )),
@@ -444,7 +442,9 @@ impl Drop for PayloadReader {
     fn drop(&mut self) {
         unsafe {
             self.data.free(&self.device);
-            if let Some(v) = self.offsets.as_mut() { v.free(&self.device) }
+            if let Some(v) = self.offsets.as_mut() {
+                v.free(&self.device)
+            }
         }
     }
 }

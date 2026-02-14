@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok((_, mut reply)) => {
             info!(
                 "Received: {:?}",
-                String::from_utf8_lossy(&reply.read_bytes(reply.bytes_until_next_obj()).unwrap())
+                String::from_utf8_lossy(reply.read_bytes(reply.bytes_until_next_obj()).unwrap())
             );
         }
         Err(e) => {

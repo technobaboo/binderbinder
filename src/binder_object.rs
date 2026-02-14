@@ -12,18 +12,19 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::{
-    device::DynTransactionHandler,
+    device::{DynBinderObject, Transaction},
+    payload::PayloadBuilder,
     sys::{
         BinderCommand, BinderHandleCookie, BinderObjectHeader, BinderType, BinderUintptrT,
         FlatBinderFlags, FlatBinderObject, FlatBinderObjectData,
     },
-    BinderDevice,
+    BinderDevice, TransactionHandler,
 };
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
 #[derive(Debug)]
 pub enum BinderObjectOrRef {
-    Object(Arc<BinderObject>),
+    Object(UntypedBinderObject),
     WeakObject(WeakBinderObject),
     Ref(Arc<BinderRef>),
     WeakRef(Arc<WeakBinderRef>),
@@ -31,7 +32,7 @@ pub enum BinderObjectOrRef {
 impl BinderObjectOrRef {
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         match self {
-            BinderObjectOrRef::Object(p) => p.get_flat_binder_object(),
+            BinderObjectOrRef::Object(p) => p.0.get_flat_binder_object(),
             BinderObjectOrRef::Ref(p) => p.get_flat_binder_object(),
             BinderObjectOrRef::WeakRef(p) => p.get_flat_binder_object(),
             BinderObjectOrRef::WeakObject(p) => p.get_flat_binder_object(),
@@ -224,42 +225,32 @@ pub struct BinderObjectId {
     pub(crate) cookie: BinderUintptrT,
 }
 
+#[derive(Debug, Clone)]
+pub struct UntypedBinderObject(pub(crate) Arc<dyn DynBinderObject>);
+impl UntypedBinderObject {
+    pub fn downcast<H: TransactionHandler>(self) -> Option<Arc<BinderObject<H>>> {
+        Arc::downcast::<BinderObject<H>>(self.0).ok()
+    }
+}
+
 /// The owned/local side of a [`BinderRef`]
-pub struct BinderObject {
+pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
-    handler: Box<dyn DynTransactionHandler>,
+    handler: H,
 }
 
-impl Debug for BinderObject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BinderObject")
-            .field("device", &self.device)
-            .field("id", &self.id)
-            .finish()
+#[async_trait::async_trait]
+impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
+    async fn handle(&self, transaction: Transaction) -> PayloadBuilder {
+        self.handler.handle(transaction).await
     }
-}
 
-impl BinderObject {
-    pub fn id(&self) -> &BinderObjectId {
-        &self.id
+    async fn handle_one_way(&self, transaction: Transaction) {
+        self.handler.handle_one_way(transaction).await
     }
-    pub(crate) fn handler(&self) -> &dyn DynTransactionHandler {
-        self.handler.as_ref()
-    }
-    pub(crate) fn new(
-        id: usize,
-        handler: Box<dyn DynTransactionHandler>,
-        device: Arc<BinderDevice>,
-    ) -> Arc<Self> {
-        Self {
-            device,
-            id: BinderObjectId { id, cookie: 0 },
-            handler,
-        }
-        .into()
-    }
-    pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
+
+    fn get_flat_binder_object(&self) -> FlatBinderObject {
         FlatBinderObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::BINDER,
@@ -271,8 +262,31 @@ impl BinderObject {
         }
     }
 }
-impl TransactionTarget for BinderObject {}
-impl TransactionTargetImpl for BinderObject {
+
+impl<H: TransactionHandler> Debug for BinderObject<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderObject")
+            .field("device", &self.device)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl<H: TransactionHandler> BinderObject<H> {
+    pub fn id(&self) -> &BinderObjectId {
+        &self.id
+    }
+    pub(crate) fn new(id: usize, handler: H, device: Arc<BinderDevice>) -> Arc<Self> {
+        Self {
+            device,
+            id: BinderObjectId { id, cookie: 0 },
+            handler,
+        }
+        .into()
+    }
+}
+impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}
+impl<H: TransactionHandler> TransactionTargetImpl for BinderObject<H> {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
         TransactionTargetHandle::Local(*self.id())
     }
@@ -316,7 +330,7 @@ impl BinderObjectId {
     }
 }
 
-impl Drop for BinderObject {
+impl<H: TransactionHandler> Drop for BinderObject<H> {
     fn drop(&mut self) {
         self.device.remove_binder_object(&self.id);
     }
@@ -341,7 +355,7 @@ impl TransactionTarget for BinderObjectOrRef {}
 impl TransactionTargetImpl for BinderObjectOrRef {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
         match self {
-            BinderObjectOrRef::Object(v) => v.get_transaction_target_handle(),
+            BinderObjectOrRef::Object(v) => v.0.get_transaction_target_handle(),
             BinderObjectOrRef::WeakObject(v) => v.get_transaction_target_handle(),
             BinderObjectOrRef::Ref(v) => v.get_transaction_target_handle(),
             BinderObjectOrRef::WeakRef(v) => v.get_transaction_target_handle(),

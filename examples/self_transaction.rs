@@ -1,5 +1,4 @@
 use binderbinder::{
-    binder_object::ContextManagerBinderRef,
     device::Transaction,
     payload::{BinderObjectType, PayloadBuilder},
     BinderDevice, TransactionHandler,
@@ -10,8 +9,8 @@ use tracing_subscriber::EnvFilter;
 
 const ECHO_CODE: u32 = 1;
 
-pub struct BinderObject;
-impl TransactionHandler for BinderObject {
+pub struct EchoService;
+impl TransactionHandler for EchoService {
     async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {
         let mut builder = PayloadBuilder::new();
         if transaction.code != ECHO_CODE {
@@ -67,21 +66,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Binder opened");
 
     info!("Setting context manager...");
-    let obj = device.register_object(BinderObject);
-    let _cm_ref = device.set_context_manager(&obj).await?;
+    let obj = device.register_object(EchoService);
+    device.set_context_manager(&obj).await?;
     info!("Context manager set!");
 
     info!("Sending echo transaction to self");
     let transaction_future = spawn_blocking(move || {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self");
-        device.transact_blocking(&ContextManagerBinderRef, ECHO_CODE, payload)
+        device.transact_blocking(&*obj, ECHO_CODE, payload)
     });
     match transaction_future.await.unwrap() {
         Ok((_, mut reply)) => {
             info!(
                 "Received: {:?}",
-                String::from_utf8_lossy(&reply.read_bytes(reply.bytes_until_next_obj()).unwrap())
+                String::from_utf8_lossy(reply.read_bytes(reply.bytes_until_next_obj()).unwrap())
             );
         }
         Err(e) => {
