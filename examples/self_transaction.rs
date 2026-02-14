@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transaction_future = spawn_blocking(move || {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self");
-        device.transact_blocking(&*obj, ECHO_CODE, payload)
+        device.transact_blocking(device.context_manager(), ECHO_CODE, payload)
     });
     match transaction_future.await.unwrap() {
         Ok((_, mut reply)) => {

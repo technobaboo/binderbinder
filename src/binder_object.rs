@@ -3,7 +3,7 @@ use std::{
     future::Future,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -344,11 +344,17 @@ pub(crate) enum TransactionTargetHandle {
 pub(crate) trait TransactionTargetImpl {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle;
 }
-pub struct ContextManagerBinderRef;
+#[derive(Debug)]
+pub struct ContextManagerBinderRef(pub(crate) AtomicUsize);
 impl TransactionTarget for ContextManagerBinderRef {}
 impl TransactionTargetImpl for ContextManagerBinderRef {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
-        TransactionTargetHandle::Remote(0)
+        let id = self.0.load(Ordering::Relaxed);
+        if id != 0 {
+            TransactionTargetHandle::Local(BinderObjectId { id, cookie: 0 })
+        } else {
+            TransactionTargetHandle::Remote(0)
+        }
     }
 }
 impl TransactionTarget for BinderObjectOrRef {}

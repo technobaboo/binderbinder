@@ -1,4 +1,4 @@
-use binderbinder::{binder_object::ContextManagerBinderRef, payload::PayloadBuilder, BinderDevice};
+use binderbinder::{payload::PayloadBuilder, BinderDevice};
 use tokio::task::spawn_blocking;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transaction_future = spawn_blocking(move || {
         let mut payload = PayloadBuilder::new();
         payload.push_bytes(b"hello from self echoed by the context manager");
-        device.transact_blocking(&ContextManagerBinderRef, ECHO_CODE, payload)
+        device.transact_blocking(device.context_manager(), ECHO_CODE, payload)
     });
     match transaction_future.await.unwrap() {
         Ok((_, mut reply)) => {

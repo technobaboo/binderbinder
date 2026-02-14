@@ -25,7 +25,8 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::binder_object::{
-    BinderObject, BinderObjectId, BinderRef, TransactionTarget, WeakBinderRef,
+    BinderObject, BinderObjectId, BinderRef, ContextManagerBinderRef, TransactionTarget,
+    WeakBinderRef,
 };
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
@@ -52,6 +53,7 @@ pub struct BinderDevice {
     pub(crate) refs: Arc<DashMap<u32, Weak<BinderRef>>>,
     pub(crate) weak_refs: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
     pub(crate) death_notifications: Arc<DashMap<usize, Arc<Notify>>>,
+    ctx_manager: ContextManagerBinderRef,
     // needed for safety
     _backing: BinderBackingMemMap,
 }
@@ -111,6 +113,7 @@ impl BinderDevice {
                 weak_refs: Arc::default(),
                 _backing: backing,
                 death_notifications: Arc::default(),
+                ctx_manager: ContextManagerBinderRef(AtomicUsize::new(0)),
             }
         });
         unsafe {
@@ -161,6 +164,8 @@ impl BinderDevice {
         handler: &BinderObject<T>,
     ) -> Result<()> {
         let buf = SetContextMGR(handler.get_flat_binder_object());
+        // if we ever change the BinderObjectId to have a non 0 cookie, this breaks
+        self.ctx_manager.0.store(handler.id().id, Ordering::Relaxed);
 
         let res = unsafe { rustix::ioctl::ioctl(self.fd.as_fd(), buf) };
         if let Err(e) = &res {
@@ -168,6 +173,9 @@ impl BinderDevice {
         }
         // TODO: find more accurate error, also this probably doesn't actually return an error
         res.map_err(|_| Error::PermissionDenied)
+    }
+    pub fn context_manager(&self) -> &ContextManagerBinderRef {
+        &self.ctx_manager
     }
 
     pub(crate) fn remove_binder_object(&self, id: &BinderObjectId) {
