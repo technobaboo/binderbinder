@@ -26,6 +26,12 @@ pub struct PayloadBuilder<'a> {
     buffer_fd_lifetime: PhantomData<&'a ()>,
     owned_fds: Vec<OwnedFd>,
 }
+impl<'a> Default for PayloadBuilder<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> PayloadBuilder<'a> {
     pub fn new() -> Self {
         Self {
@@ -164,7 +170,7 @@ impl<'a> PayloadBuilder<'a> {
         self.data.extend_from_slice(slice);
     }
     pub fn align(&mut self, align: usize) {
-        while (self.data.as_ptr().addr() + self.data.len()) % align != 0 {
+        while !(self.data.as_ptr().addr() + self.data.len()).is_multiple_of(align) {
             self.data.push(0);
         }
     }
@@ -209,10 +215,10 @@ pub struct PayloadReader {
     next_data_index: usize,
 }
 impl PayloadReader {
-    pub fn read_bytes<'a>(
-        &'a mut self,
+    pub fn read_bytes(
+        &mut self,
         num_bytes: usize,
-    ) -> Result<&'a [u8], PayloadBytesReadError> {
+    ) -> Result<&[u8], PayloadBytesReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
         // this assumes that all offsets are in order
@@ -256,7 +262,7 @@ impl PayloadReader {
         let object_or_ref = match flat_obj.hdr.type_ {
             BinderType::BINDER => BinderObjectOrRef::Object(
                 self.device
-                    .owned_ports
+                    .objects
                     .get(&BinderObjectId::from_raw(
                         unsafe { flat_obj.data.binder },
                         flat_obj.cookie,
@@ -438,7 +444,7 @@ impl Drop for PayloadReader {
     fn drop(&mut self) {
         unsafe {
             self.data.free(&self.device);
-            self.offsets.as_mut().map(|v| v.free(&self.device));
+            if let Some(v) = self.offsets.as_mut() { v.free(&self.device) }
         }
     }
 }

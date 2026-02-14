@@ -81,7 +81,7 @@ impl BinderRef {
     }
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
-        if let Some(port) = device.port_handles.get(&handle).and_then(|v| v.upgrade()) {
+        if let Some(port) = device.refs.get(&handle).and_then(|v| v.upgrade()) {
             return port;
         }
         let weak = WeakBinderRef::get_and_dedup_from_raw(device, handle);
@@ -92,7 +92,7 @@ impl BinderRef {
             device: device.clone(),
             weak,
         });
-        device.port_handles.insert(handle, Arc::downgrade(&port));
+        device.refs.insert(handle, Arc::downgrade(&port));
         port
     }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
@@ -140,11 +140,7 @@ impl WeakBinderRef {
         !self.dead.load(Ordering::Relaxed)
     }
     pub fn upgrade(&self) -> Option<Arc<BinderRef>> {
-        let handle = self
-            .device
-            .port_handles
-            .get(&self.id)
-            .and_then(|v| v.upgrade());
+        let handle = self.device.refs.get(&self.id).and_then(|v| v.upgrade());
         if let Some(handle) = handle {
             Some(handle)
         } else {
@@ -157,11 +153,7 @@ impl WeakBinderRef {
     }
     /// this should only be called when receiving a new handle
     pub(crate) fn get_and_dedup_from_raw(device: &Arc<BinderDevice>, handle: u32) -> Arc<Self> {
-        if let Some(port) = device
-            .weak_port_handles
-            .get(&handle)
-            .and_then(|v| v.upgrade())
-        {
+        if let Some(port) = device.weak_refs.get(&handle).and_then(|v| v.upgrade()) {
             return port;
         }
         let death_notif_cookie = device.death_counter.fetch_add(1, Ordering::Relaxed);
@@ -194,9 +186,7 @@ impl WeakBinderRef {
             dead,
             death_notify,
         });
-        device
-            .weak_port_handles
-            .insert(handle, Arc::downgrade(&port));
+        device.weak_refs.insert(handle, Arc::downgrade(&port));
         port
     }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
@@ -328,7 +318,7 @@ impl BinderObjectId {
 
 impl Drop for BinderObject {
     fn drop(&mut self) {
-        self.device.remove_binder_port(&self.id);
+        self.device.remove_binder_object(&self.id);
     }
 }
 #[allow(private_bounds)]

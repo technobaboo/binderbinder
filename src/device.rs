@@ -46,15 +46,17 @@ pub struct BinderDevice {
     pub(crate) object_id_counter: AtomicUsize,
     pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) owned_ports: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
-    pub(crate) port_handles: Arc<DashMap<u32, Weak<BinderRef>>>,
-    pub(crate) weak_port_handles: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
+    pub(crate) objects: Arc<DashMap<BinderObjectId, Arc<BinderObject>>>,
+    pub(crate) refs: Arc<DashMap<u32, Weak<BinderRef>>>,
+    pub(crate) weak_refs: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
     pub(crate) death_notifications: Arc<DashMap<usize, Arc<Notify>>>,
     // needed for safety
     _backing: BinderBackingMemMap,
 }
 
 impl BinderDevice {
+    /// # Safety
+    /// Assumes there is an error to be returned.
     pub unsafe fn get_last_error(&self) -> BinderExtendedError {
         let mut error = BinderExtendedError {
             id: 0,
@@ -102,9 +104,9 @@ impl BinderDevice {
                 object_id_counter: AtomicUsize::new(1),
                 death_counter: AtomicUsize::new(1),
                 _looper_threads: loopers,
-                owned_ports: Arc::default(),
-                port_handles: Arc::default(),
-                weak_port_handles: Arc::default(),
+                objects: Arc::default(),
+                refs: Arc::default(),
+                weak_refs: Arc::default(),
                 _backing: backing,
                 death_notifications: Arc::default(),
             }
@@ -129,7 +131,7 @@ impl BinderDevice {
         let handler = Box::new(handler);
         let port = BinderObject::new(cookie, handler, self.clone());
 
-        self.owned_ports.insert(*port.id(), port.clone());
+        self.objects.insert(*port.id(), port.clone());
 
         port
     }
@@ -137,7 +139,7 @@ impl BinderDevice {
     /// Send a two-way transaction and wait for reply.
     /// WARNING: Only ever call this on a thread where blocking for multiple seconds is acceptable!
     // TODO: make this work with weak handles
-    pub fn transact_blocking<'a>(
+    pub fn transact_blocking(
         self: &Arc<Self>,
         target: &dyn TransactionTarget,
         code: u32,
@@ -164,8 +166,8 @@ impl BinderDevice {
         res.map_err(|_| Error::PermissionDenied)
     }
 
-    pub(crate) fn remove_binder_port(&self, id: &BinderObjectId) {
-        self.owned_ports.remove(&id);
+    pub(crate) fn remove_binder_object(&self, id: &BinderObjectId) {
+        self.objects.remove(id);
     }
     pub(crate) unsafe fn write_binder_command(&self, data: &[u8]) {
         write_binder_command(&self.fd, data).unwrap()
@@ -182,14 +184,14 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let obj = self.owned_ports.get(id).ok_or(Error::ObjectNotFound)?;
+        let obj = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
         let handler = obj.handler();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction { code, payload }));
         let reply_reader = PayloadReader::from_builder(self.clone(), &reply);
         Ok((code, reply_reader))
     }
-    fn remote_transact_blocking<'a>(
+    fn remote_transact_blocking(
         self: &Arc<Self>,
         handle: u32,
         code: u32,
@@ -221,7 +223,7 @@ impl BinderDevice {
         let mut write_data = Some(bytes.as_slice());
         loop {
             let v = unsafe {
-                binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), &runtime)
+                binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), runtime)
             };
             match v {
                 Some(Ok(v)) => break Ok(v),
@@ -362,7 +364,7 @@ unsafe fn binder_write_read(
     //     info!(?binder_wr);
     // }
     // info!(v = write_data.is_some());
-    let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(&dev_fd, &mut binder_wr) });
+    let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(dev_fd, &mut binder_wr) });
     if let Err(err) = res {
         error!("binder write_read call failed: {err}");
         return Some(Err(WriteReadError::WriteReadIoctlFailed(err)));
@@ -372,7 +374,7 @@ unsafe fn binder_write_read(
     };
     let mut consumed = 0;
     while consumed != binder_wr.read_consumed {
-        let read_slice = &read_data[consumed..binder_wr.read_consumed as usize];
+        let read_slice = &read_data[consumed..binder_wr.read_consumed];
         let header = size_of::<u32>();
         let ret = BinderReturn::from_u32(unsafe {
             read_from_slice(&read_slice[..header], &mut consumed)
@@ -386,7 +388,7 @@ unsafe fn binder_write_read(
                 debug!("received ok");
             }
             BinderReturn::TRANSACTION_SEC_CTX | BinderReturn::TRANSACTION => {
-                let (sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
+                let (_sec_ctx, transaction) = if ret == BinderReturn::TRANSACTION_SEC_CTX {
                     let v = unsafe {
                         read_from_slice::<BinderTransactionDataSecCtx>(
                             &read_slice[header..],
@@ -407,7 +409,7 @@ unsafe fn binder_write_read(
                     unsafe { transaction.target.binder },
                     transaction.cookie,
                 );
-                let Some(handler) = device.owned_ports.get(&target) else {
+                let Some(handler) = device.objects.get(&target) else {
                     warn!("unable to find handler for: {target:x?}");
                     return Some(Err(WriteReadError::ObjectNotFound));
                 };
@@ -475,7 +477,7 @@ unsafe fn binder_write_read(
             }
             // TODO: implement?
             BinderReturn::ACQUIRE_RESULT => {
-                let v = unsafe { read_from_slice::<i32>(&read_slice[header..], &mut consumed) };
+                let _v = unsafe { read_from_slice::<i32>(&read_slice[header..], &mut consumed) };
                 debug!("attempted strong ref increase result?");
             }
             BinderReturn::DEAD_REPLY => {
@@ -502,14 +504,14 @@ unsafe fn binder_write_read(
                     .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
             }
             BinderReturn::RELEASE => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
                 // TODO: actually track
                 debug!("strong ref decrease");
             }
             BinderReturn::DECREFS => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
                 // TODO: actually track maybe?
@@ -545,7 +547,7 @@ unsafe fn binder_write_read(
                 _ = write_binder_struct_command(dev_fd, BinderCommand::DEAD_BINDER_DONE, &v);
             }
             BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
                 // TODO: impl?
@@ -565,13 +567,13 @@ unsafe fn binder_write_read(
                 debug!("transaction pending frozen")
             }
             BinderReturn::FROZEN_BINDER => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderFrozenStateInfo>(&read_slice[header..], &mut consumed)
                 };
                 debug!("frozen object")
             }
             BinderReturn::CLEAR_FREEZE_NOTIFICATION_DONE => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
                 debug!("cleared freeze notif")
