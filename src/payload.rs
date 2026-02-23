@@ -11,12 +11,15 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
-    BinderDevice, binder_object::{
-        BinderObjectId, BinderObjectOrRef, BinderRef, ToBinderObjectOrRef, UntypedBinderObject, WeakBinderObject, WeakBinderRef
-    }, sys::{
+    binder_object::{
+        BinderObjectId, BinderObjectOrRef, BinderRef, ToBinderObjectOrRef, UntypedBinderObject,
+        WeakBinderObject, WeakBinderRef,
+    },
+    sys::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
         BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
-    }
+    },
+    BinderDevice,
 };
 pub struct PayloadBuilder<'a> {
     data: Vec<u8>,
@@ -268,6 +271,7 @@ impl PayloadReader {
             )),
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
+                self.device.clone(),
             )),
             BinderType::HANDLE => {
                 BinderObjectOrRef::Ref(BinderRef::get_and_dedup_from_raw(&self.device, unsafe {

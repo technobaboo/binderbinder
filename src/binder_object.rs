@@ -47,6 +47,14 @@ impl BinderObjectOrRef {
             BinderObjectOrRef::WeakRef(p) => p.alive(),
         }
     }
+    pub fn device(&self) -> &Arc<BinderDevice> {
+        match self {
+            BinderObjectOrRef::Object(p) => p.device(),
+            BinderObjectOrRef::WeakObject(p) => &p.device,
+            BinderObjectOrRef::Ref(p) => &p.device,
+            BinderObjectOrRef::WeakRef(p) => &p.device,
+        }
+    }
 }
 
 /// The remote side of a [`BinderObject`]
@@ -231,6 +239,9 @@ impl UntypedBinderObject {
     pub fn downcast<H: TransactionHandler>(self) -> Option<Arc<BinderObject<H>>> {
         Arc::downcast::<BinderObject<H>>(self.0).ok()
     }
+    pub fn device(&self) -> &Arc<BinderDevice> {
+        self.0.device()
+    }
 }
 
 /// The owned/local side of a [`BinderRef`]
@@ -260,6 +271,9 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
             data: FlatBinderObjectData { binder: self.id.id },
             cookie: self.id.cookie,
         }
+    }
+    fn device(&self) -> &Arc<BinderDevice> {
+        &self.device
     }
 }
 
@@ -295,6 +309,7 @@ impl<H: TransactionHandler> TransactionTargetImpl for BinderObject<H> {
 /// Only returned if a remote process sends a [`WeakBinderRef`] to the process owning the [`BinderObject`]
 #[derive(Debug)]
 pub struct WeakBinderObject {
+    device: Arc<BinderDevice>,
     id: BinderObjectId,
 }
 
@@ -302,8 +317,8 @@ impl WeakBinderObject {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
-    pub(crate) fn from_id(id: BinderObjectId) -> Self {
-        Self { id }
+    pub(crate) fn from_id(id: BinderObjectId, device: Arc<BinderDevice>) -> Self {
+        Self { id, device }
     }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         FlatBinderObject {
@@ -378,7 +393,10 @@ impl<H: TransactionHandler> ToBinderObjectOrRef for Arc<BinderObject<H>> {
 }
 impl ToBinderObjectOrRef for WeakBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
-        BinderObjectOrRef::WeakObject(WeakBinderObject { id: self.id })
+        BinderObjectOrRef::WeakObject(WeakBinderObject {
+            id: self.id,
+            device: self.device.clone(),
+        })
     }
 }
 impl ToBinderObjectOrRef for Arc<BinderRef> {

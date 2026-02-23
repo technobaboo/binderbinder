@@ -142,7 +142,6 @@ impl BinderDevice {
 
     /// Send a two-way transaction and wait for reply.
     /// WARNING: Only ever call this on a thread where blocking for multiple seconds is acceptable!
-    // TODO: make this work with weak handles
     pub fn transact_blocking(
         self: &Arc<Self>,
         target: &dyn TransactionTarget,
@@ -156,6 +155,22 @@ impl BinderDevice {
             }
             crate::binder_object::TransactionTargetHandle::Remote(handle) => {
                 self.remote_transact_blocking(handle, code, data, &runtime)
+            }
+        }
+    }
+    pub fn transact_one_way(
+        self: &Arc<Self>,
+        target: &dyn TransactionTarget,
+        code: u32,
+        data: PayloadBuilder<'_>,
+    ) -> Result<()> {
+        let runtime = tokio::runtime::Handle::current();
+        match target.get_transaction_target_handle() {
+            crate::binder_object::TransactionTargetHandle::Local(id) => {
+                self.self_transact_one_way(&id, code, data, &runtime)
+            }
+            crate::binder_object::TransactionTargetHandle::Remote(handle) => {
+                self.remote_transact_one_way(handle, code, data, &runtime)
             }
         }
     }
@@ -257,6 +272,51 @@ impl BinderDevice {
                 None => continue,
             }
         }
+    }
+    fn self_transact_one_way(
+        self: &Arc<Self>,
+        id: &BinderObjectId,
+        code: u32,
+        data: PayloadBuilder<'_>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<()> {
+        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
+        let payload = PayloadReader::from_builder(self.clone(), &data);
+        runtime.block_on(handler.handle_one_way(Transaction { code, payload }));
+        Ok(())
+    }
+    fn remote_transact_one_way(
+        self: &Arc<Self>,
+        handle: u32,
+        code: u32,
+        data: PayloadBuilder<'_>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<()> {
+        let reply = BinderTransactionData {
+            target: sys::TransactionTarget { handle },
+            cookie: 0,
+            code,
+            // TODO: actually expose some of these in a reasonable way
+            flags: TransactionFlags::ACCEPT_FDS | TransactionFlags::ONE_WAY,
+            sender_pid: 0,
+            sender_euid: 0,
+            data_size: data.data_buffer_len() as BinderSizeT,
+            offsets_size: (data.offset_buffer_len() * size_of::<usize>()) as BinderSizeT,
+            data: crate::sys::BinderTransactionDataPtrs {
+                buffer: data.data_buffer_ptr() as _,
+                offsets: data.offset_buffer_ptr() as _,
+            },
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
+        bytes.extend_from_slice(&BinderCommand::TRANSACTION.as_u32().to_ne_bytes());
+        bytes.extend_from_slice(unsafe {
+            slice::from_raw_parts(&raw const reply as _, size_of_val(&reply))
+        });
+        bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
+        let mut write_data = Some(bytes.as_slice());
+        unsafe { binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), runtime) };
+        Ok(())
     }
 }
 #[derive(Debug)]
@@ -622,6 +682,7 @@ pub(crate) trait DynBinderObject:
     async fn handle(&self, transaction: Transaction) -> PayloadBuilder;
     async fn handle_one_way(&self, transaction: Transaction);
     fn get_flat_binder_object(&self) -> FlatBinderObject;
+    fn device(&self) -> &Arc<BinderDevice>;
 }
 
 pub trait TransactionHandler: Send + Sync + 'static {
