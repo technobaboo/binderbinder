@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BinderObjectOrRef {
     Object(UntypedBinderObject),
     WeakObject(WeakBinderObject),
@@ -307,7 +307,7 @@ impl<H: TransactionHandler> TransactionTargetImpl for BinderObject<H> {
 }
 
 /// Only returned if a remote process sends a [`WeakBinderRef`] to the process owning the [`BinderObject`]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WeakBinderObject {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
