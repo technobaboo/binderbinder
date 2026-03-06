@@ -244,6 +244,7 @@ impl UntypedBinderObject {
     }
 }
 
+#[derive(Debug)]
 /// The owned/local side of a [`BinderRef`]
 pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
@@ -276,13 +277,11 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
         &self.device
     }
 }
+impl<H:TransactionHandler> Deref for BinderObject<H> {
+    type Target= H;
 
-impl<H: TransactionHandler> Debug for BinderObject<H> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BinderObject")
-            .field("device", &self.device)
-            .field("id", &self.id)
-            .finish()
+    fn deref(&self) -> &Self::Target {
+        &self.handler
     }
 }
 

@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 const ECHO_CODE: u32 = 1;
 
+#[derive(Debug)]
 pub struct EchoService;
 impl TransactionHandler for EchoService {
     async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {

@@ -685,7 +685,7 @@ pub(crate) trait DynBinderObject:
     fn device(&self) -> &Arc<BinderDevice>;
 }
 
-pub trait TransactionHandler: Send + Sync + 'static {
+pub trait TransactionHandler: Debug + Send + Sync + 'static {
     fn handle(
         &self,
         transaction: Transaction,
