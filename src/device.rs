@@ -49,7 +49,7 @@ pub struct BinderDevice {
     pub(crate) object_id_counter: AtomicUsize,
     pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) objects: Arc<DashMap<BinderObjectId, Arc<dyn DynBinderObject>>>,
+    pub(crate) objects: Arc<DashMap<BinderObjectId, Weak<dyn DynBinderObject>>>,
     pub(crate) refs: Arc<DashMap<u32, Weak<BinderRef>>>,
     pub(crate) weak_refs: Arc<DashMap<u32, Weak<WeakBinderRef>>>,
     pub(crate) death_notifications: Arc<DashMap<usize, Arc<Notify>>>,
@@ -133,11 +133,12 @@ impl BinderDevice {
     ) -> Arc<BinderObject<T>> {
         let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
 
-        let port = BinderObject::new(cookie, handler, self.clone());
+        let obj = BinderObject::new(cookie, handler, self.clone());
 
-        self.objects.insert(*port.id(), port.clone());
+        let dyn_obj: Arc<dyn DynBinderObject> = obj.clone();
+        self.objects.insert(*obj.id(), Arc::downgrade(&dyn_obj));
 
-        port
+        obj
     }
 
     /// Send a two-way transaction and wait for reply.
@@ -211,7 +212,12 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
+        let handler = self
+            .objects
+            .get(id)
+            .ok_or(Error::ObjectNotFound)?
+            .upgrade()
+            .ok_or(Error::DeadBinder)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction { code, payload }));
         let reply_reader = PayloadReader::from_builder(self.clone(), &reply);
@@ -280,7 +286,12 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
-        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?;
+        let handler = self
+            .objects
+            .get(id)
+            .ok_or(Error::ObjectNotFound)?
+            .upgrade()
+            .ok_or(Error::DeadBinder)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
         runtime.block_on(handler.handle_one_way(Transaction { code, payload }));
         Ok(())
@@ -484,6 +495,10 @@ unsafe fn binder_write_read(
                     warn!("unable to find handler for: {target:x?}");
                     return Some(Err(WriteReadError::ObjectNotFound));
                 };
+                let Some(handler) = handler.upgrade() else {
+                    warn!("handler for {target:x?} is dead");
+                    return Some(Err(WriteReadError::ObjectNotFound));
+                };
                 let payload_reader = unsafe {
                     PayloadReader::from_kernel_raw(
                         device.clone(),
@@ -567,18 +582,30 @@ unsafe fn binder_write_read(
                     .inspect_err(|err| error!("failed to send INCREFS_DONE: {err}"));
             }
             BinderReturn::ACQUIRE => {
-                let v = unsafe {
+                let target = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                // TODO: actually track
-                _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &v)
+                let obj = device
+                    .objects
+                    .get(&BinderObjectId::from_raw(target.ptr, target.cookie))
+                    .and_then(|v| v.upgrade());
+                if let Some(obj) = obj {
+                    obj.strong_increase();
+                }
+                _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &target)
                     .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
             }
             BinderReturn::RELEASE => {
-                let _v = unsafe {
+                let target = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                // TODO: actually track
+                let obj = device
+                    .objects
+                    .get(&BinderObjectId::from_raw(target.ptr, target.cookie))
+                    .and_then(|v| v.upgrade());
+                if let Some(obj) = obj {
+                    obj.strong_decrease();
+                }
                 debug!("strong ref decrease");
             }
             BinderReturn::DECREFS => {
@@ -681,6 +708,8 @@ pub(crate) trait DynBinderObject:
 {
     async fn handle(&self, transaction: Transaction) -> PayloadBuilder;
     async fn handle_one_way(&self, transaction: Transaction);
+    fn strong_increase(&self);
+    fn strong_decrease(&self);
     fn get_flat_binder_object(&self) -> FlatBinderObject;
     fn device(&self) -> &Arc<BinderDevice>;
 }

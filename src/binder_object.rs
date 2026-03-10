@@ -3,7 +3,7 @@ use std::{
     future::Future,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -249,6 +249,8 @@ impl UntypedBinderObject {
 pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
+    strong_count_hit_zero: Notify,
+    strong_count: AtomicU32,
     handler: H,
 }
 
@@ -276,9 +278,19 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
     fn device(&self) -> &Arc<BinderDevice> {
         &self.device
     }
+    fn strong_increase(&self) {
+        self.strong_count.fetch_add(1, Ordering::Relaxed);
+    }
+    fn strong_decrease(&self) {
+        let v = self.strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        // strong count hit 0
+        if v == 0 {
+            self.strong_count_hit_zero.notify_waiters();
+        }
+    }
 }
-impl<H:TransactionHandler> Deref for BinderObject<H> {
-    type Target= H;
+impl<H: TransactionHandler> Deref for BinderObject<H> {
+    type Target = H;
 
     fn deref(&self) -> &Self::Target {
         &self.handler
@@ -289,11 +301,16 @@ impl<H: TransactionHandler> BinderObject<H> {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
+    pub async fn strong_refs_hit_zero(&self) {
+        self.strong_count_hit_zero.notified().await
+    }
     pub(crate) fn new(id: usize, handler: H, device: Arc<BinderDevice>) -> Arc<Self> {
         Self {
             device,
             id: BinderObjectId { id, cookie: 0 },
             handler,
+            strong_count: AtomicU32::new(0),
+            strong_count_hit_zero: Notify::new(),
         }
         .into()
     }

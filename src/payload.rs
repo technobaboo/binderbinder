@@ -235,13 +235,13 @@ impl PayloadReader {
             Err(PayloadBytesReadError::OutOfBounds)
         }
     }
-    pub fn read_binder_ref(&mut self) -> Result<BinderObjectOrRef, PayloadPortReadError> {
+    pub fn read_binder_ref(&mut self) -> Result<BinderObjectOrRef, PayloadBinderRefReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
 
         let offset = *offsets
             .and_then(|v| v.get(self.next_offset_index))
-            .ok_or(PayloadPortReadError::Empty)?;
+            .ok_or(PayloadBinderRefReadError::Empty)?;
         let header_bytes = &data[offset..offset + size_of::<BinderObjectHeader>()];
         let header =
             unsafe { ptr::read_unaligned(header_bytes.as_ptr() as *const BinderObjectHeader) };
@@ -252,7 +252,7 @@ impl PayloadReader {
                 | BinderType::WEAK_BINDER
                 | BinderType::WEAK_HANDLE
         ) {
-            return Err(PayloadPortReadError::IncorrectObject);
+            return Err(PayloadBinderRefReadError::IncorrectObject);
         }
 
         let flat_bytes = &data[offset..offset + size_of::<FlatBinderObject>()];
@@ -266,8 +266,9 @@ impl PayloadReader {
                         unsafe { flat_obj.data.binder },
                         flat_obj.cookie,
                     ))
-                    .ok_or(PayloadPortReadError::UnknownOwnedPort)?
-                    .clone(),
+                    .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?
+                    .upgrade()
+                    .ok_or(PayloadBinderRefReadError::DeadBinderObject)?,
             )),
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
@@ -452,12 +453,14 @@ impl Drop for PayloadReader {
 }
 
 #[derive(Error, Debug)]
-pub enum PayloadPortReadError {
+pub enum PayloadBinderRefReadError {
     #[error("Unexpected object type")]
     IncorrectObject,
-    #[error("Unknown OwnedPort")]
-    UnknownOwnedPort,
-    #[error("No more ports to read")]
+    #[error("Unknown BinderObject")]
+    UnknownBinderObject,
+    #[error("Dead BinderObject")]
+    DeadBinderObject,
+    #[error("No more objects to read")]
     Empty,
 }
 #[derive(Error, Debug)]
