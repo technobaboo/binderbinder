@@ -293,7 +293,7 @@ impl BinderDevice {
             .upgrade()
             .ok_or(Error::DeadBinder)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
-        runtime.block_on(handler.handle_one_way(Transaction { code, payload }));
+        tokio::spawn(async move { handler.handle_one_way(Transaction { code, payload }).await });
         Ok(())
     }
     fn remote_transact_one_way(
