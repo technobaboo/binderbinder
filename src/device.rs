@@ -10,6 +10,7 @@ use core::slice;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rustix::process::{self, RawPid, RawUid};
 use std::any::Any;
 use std::ffi::c_void;
 use std::fmt::Debug;
@@ -40,6 +41,8 @@ use dashmap::DashMap;
 pub struct Transaction {
     pub code: u32,
     pub payload: PayloadReader,
+    pub sender_pid: RawPid,
+    pub sender_euid: RawUid,
 }
 
 /// Shared binder device state.
@@ -168,7 +171,7 @@ impl BinderDevice {
         let runtime = tokio::runtime::Handle::current();
         match target.get_transaction_target_handle() {
             crate::binder_object::TransactionTargetHandle::Local(id) => {
-                self.self_transact_one_way(&id, code, data, &runtime)
+                self.self_transact_one_way(&id, code, data)
             }
             crate::binder_object::TransactionTargetHandle::Remote(handle) => {
                 self.remote_transact_one_way(handle, code, data, &runtime)
@@ -219,7 +222,12 @@ impl BinderDevice {
             .upgrade()
             .ok_or(Error::DeadBinder)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
-        let reply = runtime.block_on(handler.handle(Transaction { code, payload }));
+        let reply = runtime.block_on(handler.handle(Transaction {
+            code,
+            payload,
+            sender_pid: process::getpid().as_raw_pid(),
+            sender_euid: process::geteuid().as_raw(),
+        }));
         let reply_reader = PayloadReader::from_builder(self.clone(), &reply);
         Ok((code, reply_reader))
     }
@@ -284,7 +292,6 @@ impl BinderDevice {
         id: &BinderObjectId,
         code: u32,
         data: PayloadBuilder<'_>,
-        runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
         let handler = self
             .objects
@@ -293,7 +300,16 @@ impl BinderDevice {
             .upgrade()
             .ok_or(Error::DeadBinder)?;
         let payload = PayloadReader::from_builder(self.clone(), &data);
-        tokio::spawn(async move { handler.handle_one_way(Transaction { code, payload }).await });
+        tokio::spawn(async move {
+            handler
+                .handle_one_way(Transaction {
+                    code,
+                    payload,
+                    sender_pid: process::getpid().as_raw_pid(),
+                    sender_euid: process::geteuid().as_raw(),
+                })
+                .await
+        });
         Ok(())
     }
     fn remote_transact_one_way(
@@ -512,11 +528,15 @@ unsafe fn binder_write_read(
                     runtime.block_on(handler.handle_one_way(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
+                        sender_pid: transaction.sender_pid,
+                        sender_euid: transaction.sender_euid,
                     }));
                 } else {
                     let reply_data = runtime.block_on(handler.handle(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
+                        sender_pid: transaction.sender_pid,
+                        sender_euid: transaction.sender_euid,
                     }));
 
                     let reply = BinderTransactionData {
