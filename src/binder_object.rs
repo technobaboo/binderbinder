@@ -1,6 +1,7 @@
 use std::{
     fmt::Debug,
     future::Future,
+    hash::{Hash, Hasher},
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -22,7 +23,7 @@ use crate::{
 };
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum BinderObjectOrRef {
     Object(UntypedBinderObject),
     WeakObject(WeakBinderObject),
@@ -63,6 +64,18 @@ pub struct BinderRef {
     device: Arc<BinderDevice>,
     weak: Arc<WeakBinderRef>,
 }
+impl Hash for BinderRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.weak.hash(state);
+    }
+}
+impl PartialEq for BinderRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl Eq for BinderRef {}
 
 impl Deref for BinderRef {
     type Target = Arc<WeakBinderRef>;
@@ -70,15 +83,6 @@ impl Deref for BinderRef {
     fn deref(&self) -> &Self::Target {
         &self.weak
     }
-}
-
-/// Weak version of [`BinderRef`]
-#[derive(Debug)]
-pub struct WeakBinderRef {
-    device: Arc<BinderDevice>,
-    id: u32,
-    dead: Arc<AtomicBool>,
-    death_notify: Arc<Notify>,
 }
 
 impl BinderRef {
@@ -133,6 +137,28 @@ impl Drop for BinderRef {
         }
     }
 }
+
+/// Weak version of [`BinderRef`]
+#[derive(Debug)]
+pub struct WeakBinderRef {
+    device: Arc<BinderDevice>,
+    id: u32,
+    dead: Arc<AtomicBool>,
+    death_notify: Arc<Notify>,
+}
+
+impl Hash for WeakBinderRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.id.hash(state);
+    }
+}
+impl PartialEq for WeakBinderRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl Eq for WeakBinderRef {}
 
 impl WeakBinderRef {
     /// future returns when the remote object died
@@ -244,8 +270,21 @@ impl UntypedBinderObject {
     }
 }
 
-#[derive(Debug)]
+impl Hash for UntypedBinderObject {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.obj_hash(state);
+    }
+}
+impl PartialEq for UntypedBinderObject {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.device(), other.device()) && self.0.obj_id() == other.0.obj_id()
+    }
+}
+
+impl Eq for UntypedBinderObject {}
+
 /// The owned/local side of a [`BinderRef`]
+#[derive(Debug)]
 pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
@@ -288,6 +327,12 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
             self.strong_count_hit_zero.notify_waiters();
         }
     }
+    fn obj_hash(&self, mut state: &mut dyn Hasher) {
+        self.hash(&mut state);
+    }
+    fn obj_id(&self) -> &BinderObjectId {
+        self.id()
+    }
 }
 impl<H: TransactionHandler> Deref for BinderObject<H> {
     type Target = H;
@@ -329,6 +374,19 @@ pub struct WeakBinderObject {
     id: BinderObjectId,
 }
 
+impl Hash for WeakBinderObject {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.id.hash(state);
+    }
+}
+impl PartialEq for WeakBinderObject {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl Eq for WeakBinderObject {}
+
 impl WeakBinderObject {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
@@ -360,6 +418,19 @@ impl BinderObjectId {
         Self { id: binder, cookie }
     }
 }
+
+impl<T: TransactionHandler> Hash for BinderObject<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.id.hash(state);
+    }
+}
+impl<H: TransactionHandler> PartialEq for BinderObject<H> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl<H: TransactionHandler> Eq for BinderObject<H> {}
 
 impl<H: TransactionHandler> Drop for BinderObject<H> {
     fn drop(&mut self) {

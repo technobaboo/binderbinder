@@ -14,6 +14,7 @@ use rustix::process::{self, RawPid, RawUid};
 use std::any::Any;
 use std::ffi::c_void;
 use std::fmt::Debug;
+use std::hash::Hasher;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
@@ -732,6 +733,8 @@ pub(crate) trait DynBinderObject:
     fn strong_decrease(&self);
     fn get_flat_binder_object(&self) -> FlatBinderObject;
     fn device(&self) -> &Arc<BinderDevice>;
+    fn obj_hash(&self, state: &mut dyn Hasher);
+    fn obj_id(&self) -> &BinderObjectId;
 }
 
 pub trait TransactionHandler: Debug + Send + Sync + 'static {
