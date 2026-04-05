@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 
@@ -358,6 +358,19 @@ impl<H: TransactionHandler> BinderObject<H> {
             strong_count_hit_zero: Notify::new(),
         }
         .into()
+    }
+    pub(crate) fn new_cyclic(
+        id: usize,
+        f: impl FnOnce(&Weak<Self>) -> H,
+        device: Arc<BinderDevice>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            device,
+            id: BinderObjectId { id, cookie: 0 },
+            handler: f(weak),
+            strong_count: AtomicU32::new(0),
+            strong_count_hit_zero: Notify::new(),
+        })
     }
 }
 impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}

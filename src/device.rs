@@ -145,6 +145,23 @@ impl BinderDevice {
         obj
     }
 
+    /// Like [`register_object`](Self::register_object), but the closure receives a
+    /// `&Weak<BinderObject<T>>` so the handler can store a weak self-reference.
+    /// The weak reference will not upgrade until the closure returns.
+    pub fn register_object_cyclic<T: TransactionHandler>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Weak<BinderObject<T>>) -> T,
+    ) -> Arc<BinderObject<T>> {
+        let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
+
+        let obj = BinderObject::new_cyclic(cookie, f, self.clone());
+
+        let dyn_obj: Arc<dyn DynBinderObject> = obj.clone();
+        self.objects.insert(*obj.id(), Arc::downgrade(&dyn_obj));
+
+        obj
+    }
+
     /// Send a two-way transaction and wait for reply.
     /// WARNING: Only ever call this on a thread where blocking for multiple seconds is acceptable!
     pub fn transact_blocking(
