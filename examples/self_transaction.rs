@@ -12,7 +12,8 @@ const ECHO_CODE: u32 = 1;
 #[derive(Debug)]
 pub struct EchoService;
 impl TransactionHandler for EchoService {
-    async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {
+    type ObjectResource = ();
+    async fn handle(&self, mut transaction: Transaction, _obj_res: &()) -> PayloadBuilder<'_> {
         let mut builder = PayloadBuilder::new();
         if transaction.code != ECHO_CODE {
             builder.push_bytes(b"unknown transaction code");
@@ -51,7 +52,7 @@ impl TransactionHandler for EchoService {
         builder
     }
 
-    async fn handle_one_way(&self, _transaction: binderbinder::device::Transaction) {
+    async fn handle_one_way(&self, _transaction: binderbinder::device::Transaction, _obj_res: &()) {
         info!("got oneway transaction")
     }
 }

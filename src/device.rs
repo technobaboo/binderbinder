@@ -755,13 +755,16 @@ pub(crate) trait DynBinderObject:
 }
 
 pub trait TransactionHandler: Debug + Send + Sync + 'static {
+    type ObjectResource: Send + Sync + 'static + Debug + Default;
     fn handle(
         &self,
         transaction: Transaction,
+        obj_res: &Self::ObjectResource,
     ) -> impl std::future::Future<Output = PayloadBuilder<'_>> + std::marker::Send;
 
     fn handle_one_way(
         &self,
         transaction: Transaction,
+        obj_res: &Self::ObjectResource,
     ) -> impl std::future::Future<Output = ()> + std::marker::Send;
 }

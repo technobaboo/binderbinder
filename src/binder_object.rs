@@ -291,16 +291,17 @@ pub struct BinderObject<H: TransactionHandler> {
     strong_count_hit_zero: Notify,
     strong_count: AtomicU32,
     handler: H,
+    object_res: H::ObjectResource,
 }
 
 #[async_trait::async_trait]
 impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
     async fn handle(&self, transaction: Transaction) -> PayloadBuilder {
-        self.handler.handle(transaction).await
+        self.handler.handle(transaction, &self.object_res).await
     }
 
     async fn handle_one_way(&self, transaction: Transaction) {
-        self.handler.handle_one_way(transaction).await
+        self.handler.handle_one_way(transaction, &self.object_res).await
     }
 
     fn get_flat_binder_object(&self) -> FlatBinderObject {
@@ -356,6 +357,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler,
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
+            object_res: H::ObjectResource::default(),
         }
         .into()
     }
@@ -370,6 +372,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler: f(weak),
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
+            object_res: H::ObjectResource::default(),
         })
     }
 }
