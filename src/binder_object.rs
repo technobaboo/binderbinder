@@ -289,6 +289,7 @@ pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
     strong_count_hit_zero: Notify,
+    strong_count_not_zero: Notify,
     strong_count: AtomicU32,
     handler: H,
     object_res: H::ObjectResource,
@@ -301,7 +302,9 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
     }
 
     async fn handle_one_way(&self, transaction: Transaction) {
-        self.handler.handle_one_way(transaction, &self.object_res).await
+        self.handler
+            .handle_one_way(transaction, &self.object_res)
+            .await
     }
 
     fn get_flat_binder_object(&self) -> FlatBinderObject {
@@ -319,7 +322,10 @@ impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
         &self.device
     }
     fn strong_increase(&self) {
-        self.strong_count.fetch_add(1, Ordering::Relaxed);
+        let v = self.strong_count.fetch_add(1, Ordering::Relaxed);
+        if v == 0 {
+            self.strong_count_not_zero.notify_waiters();
+        }
     }
     fn strong_decrease(&self) {
         let v = self.strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -347,8 +353,13 @@ impl<H: TransactionHandler> BinderObject<H> {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
+    /// Binder strong refs decreased to zero
     pub async fn strong_refs_hit_zero(&self) {
         self.strong_count_hit_zero.notified().await
+    }
+    /// Binder strong refs increased from zero to above zero
+    pub async fn strong_refs_not_zero(&self) {
+        self.strong_count_not_zero.notified().await
     }
     pub(crate) fn new(id: usize, handler: H, device: Arc<BinderDevice>) -> Arc<Self> {
         Self {
@@ -357,6 +368,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler,
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
+            strong_count_not_zero: Notify::new(),
             object_res: H::ObjectResource::default(),
         }
         .into()
@@ -372,6 +384,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler: f(weak),
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
+            strong_count_not_zero: Notify::new(),
             object_res: H::ObjectResource::default(),
         })
     }
