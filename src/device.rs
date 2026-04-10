@@ -360,8 +360,21 @@ impl BinderDevice {
         });
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let mut write_data = Some(bytes.as_slice());
-        unsafe { binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), runtime) };
-        Ok(())
+        let v = unsafe {
+            binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), runtime)
+        };
+
+        Err(match v {
+            Some(Err(WriteReadError::NoDevice)) => Error::Shutdown,
+            Some(Err(WriteReadError::DeadReply)) => Error::DeadReply,
+            Some(Err(WriteReadError::ObjectNotFound)) => Error::ObjectNotFound,
+            Some(Err(WriteReadError::FailedReply)) => {
+                error!("{}", WriteReadError::FailedReply);
+                Error::Unknown(1)
+            }
+            Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => Error::Binder(err),
+            _ => return Ok(()),
+        })
     }
 }
 #[derive(Debug)]
