@@ -289,7 +289,7 @@ pub struct BinderObject<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
     strong_count_hit_zero: Notify,
-    strong_count_not_zero: Notify,
+    strong_count_not_zero: Arc<Notify>,
     strong_count: AtomicU32,
     handler: H,
     object_res: H::ObjectResource,
@@ -358,8 +358,9 @@ impl<H: TransactionHandler> BinderObject<H> {
         self.strong_count_hit_zero.notified().await
     }
     /// Binder strong refs increased from zero to above zero
-    pub async fn strong_refs_not_zero(&self) {
-        self.strong_count_not_zero.notified().await
+    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self.strong_count_not_zero.clone();
+        async move { notify.notified().await }
     }
     pub(crate) fn new(id: usize, handler: H, device: Arc<BinderDevice>) -> Arc<Self> {
         Self {
@@ -368,7 +369,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler,
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
-            strong_count_not_zero: Notify::new(),
+            strong_count_not_zero: Arc::new(Notify::new()),
             object_res: H::ObjectResource::default(),
         }
         .into()
@@ -384,7 +385,7 @@ impl<H: TransactionHandler> BinderObject<H> {
             handler: f(weak),
             strong_count: AtomicU32::new(0),
             strong_count_hit_zero: Notify::new(),
-            strong_count_not_zero: Notify::new(),
+            strong_count_not_zero: Arc::new(Notify::new()),
             object_res: H::ObjectResource::default(),
         })
     }
