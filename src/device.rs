@@ -538,14 +538,15 @@ unsafe fn binder_write_read(
                     unsafe { transaction.target.binder },
                     transaction.cookie,
                 );
-                let Some(handler) = device.objects.get(&target) else {
+                let Some(handler_weak) = device.objects.get(&target) else {
                     warn!("unable to find handler for: {target:x?}");
                     return Some(Err(WriteReadError::ObjectNotFound));
                 };
-                let Some(handler) = handler.upgrade() else {
+                let Some(handler) = handler_weak.upgrade() else {
                     warn!("handler for {target:x?} is dead");
                     return Some(Err(WriteReadError::ObjectNotFound));
                 };
+                drop(handler_weak); // otherwise we hold 2 refs to the same dashmap entry and deadlock
                 let payload_reader = unsafe {
                     PayloadReader::from_kernel_raw(
                         device.clone(),
