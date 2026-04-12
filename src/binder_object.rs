@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BinderObjectOrRef {
     Object(BorrowedBinderObject),
     WeakObject(WeakBinderObject),
