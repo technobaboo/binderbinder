@@ -11,9 +11,10 @@ const ECHO_CODE: u32 = 1;
 
 #[derive(Debug)]
 pub struct EchoService;
+
+#[async_trait::async_trait]
 impl TransactionHandler for EchoService {
-    type ObjectResource = ();
-    async fn handle(&self, mut transaction: Transaction, _obj_res: &()) -> PayloadBuilder<'_> {
+    async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {
         let mut builder = PayloadBuilder::new();
         if transaction.code != ECHO_CODE {
             builder.push_bytes(b"unknown transaction code");
@@ -52,7 +53,7 @@ impl TransactionHandler for EchoService {
         builder
     }
 
-    async fn handle_one_way(&self, _transaction: binderbinder::device::Transaction, _obj_res: &()) {
+    async fn handle_one_way(&self, _transaction: Transaction) {
         info!("got oneway transaction")
     }
 }
@@ -68,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Binder opened");
 
     info!("Setting context manager...");
-    let obj = device.register_object(EchoService);
+    let obj = device.register_object_owned(EchoService);
     device.set_context_manager(&obj).await?;
     info!("Context manager set!");
 

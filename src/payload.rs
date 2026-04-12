@@ -12,7 +12,7 @@ use tracing::error;
 
 use crate::{
     binder_object::{
-        BinderObjectId, BinderObjectOrRef, BinderRef, ToBinderObjectOrRef, UntypedBinderObject,
+        BinderObjectId, BinderObjectOrRef, BinderRef, BorrowedBinderObject, ToBinderObjectOrRef,
         WeakBinderObject, WeakBinderRef,
     },
     sys::{
@@ -118,6 +118,8 @@ impl<'a> PayloadBuilder<'a> {
         offset
     }
     /// returns offset, used for child buffers
+    /// # Safety
+    /// Caller must ensure the parent buffer remains valid for the lifetime of the child buffer.
     pub unsafe fn push_child_buffer(
         &mut self,
         bytes: &[u8],
@@ -146,6 +148,8 @@ impl<'a> PayloadBuilder<'a> {
         self.data.extend_from_slice(slice);
         offset
     }
+    /// # Safety
+    /// Caller must ensure the parent buffer remains valid for the lifetime of the child buffer.
     pub unsafe fn push_fd_array(
         &mut self,
         num_fds: usize,
@@ -259,17 +263,18 @@ impl PayloadReader {
         let flat_obj =
             unsafe { ptr::read_unaligned(flat_bytes.as_ptr() as *const FlatBinderObject) };
         let object_or_ref = match flat_obj.hdr.type_ {
-            BinderType::BINDER => BinderObjectOrRef::Object(UntypedBinderObject(
-                self.device
-                    .objects
-                    .get(&BinderObjectId::from_raw(
-                        unsafe { flat_obj.data.binder },
-                        flat_obj.cookie,
-                    ))
-                    .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?
-                    .upgrade()
-                    .ok_or(PayloadBinderRefReadError::DeadBinderObject)?,
-            )),
+            BinderType::BINDER => {
+                let id = BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie);
+                let handler = self
+                    .device
+                    .get_handler(&id)
+                    .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?;
+                BinderObjectOrRef::Object(BorrowedBinderObject {
+                    device: self.device.clone(),
+                    id,
+                    handler,
+                })
+            }
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),
                 self.device.clone(),

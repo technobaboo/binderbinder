@@ -1,31 +1,3 @@
-//! Async Tokio-based Binder device implementation.
-//!
-//! Architecture:
-//! - Single writer task per device (handles outgoing transactions)
-//! - Multiple service tasks (one per worker, handle incoming via epoll)
-//! - Arc<BinderDevice> shared across all tasks
-//! - DashMap for thread-safe pending_replies and service_handlers
-
-use core::slice;
-use rustix::fs::{Mode, OFlags};
-use rustix::io::{self, Errno};
-use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
-use rustix::process::{self, RawPid, RawUid};
-use std::any::Any;
-use std::ffi::c_void;
-use std::fmt::Debug;
-use std::hash::Hasher;
-use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::thread::sleep;
-use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, warn};
-
 use crate::binder_object::{
     BinderObject, BinderObjectId, BinderRef, ContextManagerBinderRef, TransactionTarget,
     WeakBinderRef,
@@ -37,13 +9,47 @@ use crate::sys::{
     BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT,
     BinderWriteRead, FlatBinderObject, SetContextMGR, SetMaxThreads, TransactionFlags,
 };
+use core::slice;
 use dashmap::DashMap;
+use rustix::fs::{Mode, OFlags};
+use rustix::io::{self, Errno};
+use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rustix::process::{self, RawPid, RawUid};
+use std::any::Any;
+use std::ffi::c_void;
+use std::fmt::Debug;
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+use std::thread::sleep;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::sync::Notify;
+use tracing::{debug, error, info, trace, warn};
 
 pub struct Transaction {
     pub code: u32,
     pub payload: PayloadReader,
     pub sender_pid: RawPid,
     pub sender_euid: RawUid,
+}
+
+#[derive(Debug)]
+pub(crate) struct ObjectRefState {
+    pub strong_count: AtomicU32,
+    pub strong_count_hit_zero: Notify,
+    pub strong_count_not_zero: Arc<Notify>,
+}
+impl ObjectRefState {
+    pub fn new() -> Self {
+        Self {
+            strong_count: AtomicU32::new(0),
+            strong_count_hit_zero: Notify::new(),
+            strong_count_not_zero: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// Shared binder device state.
@@ -53,7 +59,9 @@ pub struct BinderDevice {
     pub(crate) object_id_counter: AtomicUsize,
     pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) objects: DashMap<BinderObjectId, Weak<dyn DynBinderObject>>,
+    pub(crate) objects: DashMap<BinderObjectId, Arc<dyn TransactionHandler>>,
+    pub(crate) object_refcounts: DashMap<BinderObjectId, ObjectRefState>,
+    pub(crate) retained_services: DashMap<BinderObjectId, Box<dyn Any + Send + Sync>>,
     pub(crate) refs: DashMap<u32, Weak<BinderRef>>,
     pub(crate) weak_refs: DashMap<u32, Weak<WeakBinderRef>>,
     pub(crate) death_notifications: DashMap<usize, Arc<Notify>>,
@@ -113,6 +121,8 @@ impl BinderDevice {
                 death_counter: AtomicUsize::new(1),
                 _looper_threads: loopers,
                 objects: DashMap::default(),
+                object_refcounts: DashMap::default(),
+                retained_services: DashMap::default(),
                 refs: DashMap::default(),
                 weak_refs: DashMap::default(),
                 _backing: backing,
@@ -127,39 +137,76 @@ impl BinderDevice {
         dev
     }
 
-    /// Register a handler for incoming transactions and return a binder object.
+    /// Register a handler for incoming transactions and return a capability guard.
     ///
     /// When the returned `BinderObject` is dropped, the handler is automatically
     /// unregistered from the device (RAII pattern).
     pub fn register_object<T: TransactionHandler>(
         self: &Arc<Self>,
-        handler: T,
-    ) -> Arc<BinderObject<T>> {
+        handler: Arc<T>,
+    ) -> BinderObject<T> {
         let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
+        let id = BinderObjectId {
+            id: cookie,
+            cookie: 0,
+        };
 
-        let obj = BinderObject::new(cookie, handler, self.clone());
+        self.objects.insert(id, handler.clone());
+        self.object_refcounts.insert(id, ObjectRefState::new());
 
-        let dyn_obj: Arc<dyn DynBinderObject> = obj.clone();
-        self.objects.insert(*obj.id(), Arc::downgrade(&dyn_obj));
+        BinderObject {
+            device: self.clone(),
+            id,
+            handler,
+        }
+    }
 
-        obj
+    /// Like [`register_object`](Self::register_object), but wraps the handler in an Arc for you.
+    pub fn register_object_owned<T: TransactionHandler>(
+        self: &Arc<Self>,
+        handler: T,
+    ) -> BinderObject<T> {
+        self.register_object(Arc::new(handler))
     }
 
     /// Like [`register_object`](Self::register_object), but the closure receives a
-    /// `&Weak<BinderObject<T>>` so the handler can store a weak self-reference.
-    /// The weak reference will not upgrade until the closure returns.
+    /// `&Weak<T>` so the handler can store a weak self-reference.
     pub fn register_object_cyclic<T: TransactionHandler>(
         self: &Arc<Self>,
-        f: impl FnOnce(&Weak<BinderObject<T>>) -> T,
-    ) -> Arc<BinderObject<T>> {
-        let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
+        f: impl FnOnce(&Weak<T>) -> T,
+    ) -> BinderObject<T> {
+        let handler = Arc::new_cyclic(f);
+        self.register_object(handler)
+    }
 
-        let obj = BinderObject::new_cyclic(cookie, f, self.clone());
+    /// "Service mode": device holds the guard until strong refs hit zero.
+    /// Returns the handler Arc so the caller can still use it.
+    pub fn retain_as_service<T: TransactionHandler>(
+        self: &Arc<Self>,
+        guard: BinderObject<T>,
+    ) -> Arc<T> {
+        let handler = guard.handler.clone();
+        let id = guard.id;
+        let device = self.clone();
 
-        let dyn_obj: Arc<dyn DynBinderObject> = obj.clone();
-        self.objects.insert(*obj.id(), Arc::downgrade(&dyn_obj));
+        // Move guard into retained_services so it stays alive
+        self.retained_services.insert(id, Box::new(guard));
 
-        obj
+        // Spawn a task to clean up when strong refs hit zero
+        tokio::spawn(async move {
+            if let Some(refstate) = device.object_refcounts.get(&id) {
+                refstate.strong_count_hit_zero.notified().await;
+            }
+            // Remove from retained_services, which drops the guard, which removes from objects
+            device.retained_services.remove(&id);
+        });
+
+        handler
+    }
+
+    /// Get the handler for a given object ID (for payload decoding / downcasting).
+    pub fn get_handler(&self, id: &BinderObjectId) -> Option<Arc<dyn TransactionHandler>> {
+        self.objects.get(id).map(|v| v.value().clone())
     }
 
     /// Send a two-way transaction and wait for reply.
@@ -198,11 +245,21 @@ impl BinderDevice {
     }
     pub async fn set_context_manager<T: TransactionHandler>(
         &self,
-        handler: &BinderObject<T>,
+        obj: &BinderObject<T>,
     ) -> Result<()> {
-        let buf = SetContextMGR(handler.get_flat_binder_object());
+        let flat = FlatBinderObject {
+            hdr: crate::sys::BinderObjectHeader {
+                type_: crate::sys::BinderType::BINDER,
+            },
+            flags: crate::sys::FlatBinderFlags::ACCEPTS_FDS,
+            data: crate::sys::FlatBinderObjectData {
+                binder: obj.id().id,
+            },
+            cookie: obj.id().cookie,
+        };
+        let buf = SetContextMGR(flat);
         // if we ever change the BinderObjectId to have a non 0 cookie, this breaks
-        self.ctx_manager.0.store(handler.id().id, Ordering::Relaxed);
+        self.ctx_manager.0.store(obj.id().id, Ordering::Relaxed);
 
         let res = unsafe { rustix::ioctl::ioctl(self.fd.as_fd(), buf) };
         if let Err(e) = &res {
@@ -217,6 +274,7 @@ impl BinderDevice {
 
     pub(crate) fn remove_binder_object(&self, id: &BinderObjectId) {
         self.objects.remove(id);
+        self.object_refcounts.remove(id);
     }
     pub(crate) unsafe fn write_binder_command(&self, data: &[u8]) {
         write_binder_command(&self.fd, data).unwrap()
@@ -233,12 +291,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let handler = self
-            .objects
-            .get(id)
-            .ok_or(Error::ObjectNotFound)?
-            .upgrade()
-            .ok_or(Error::DeadBinder)?;
+        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction {
             code,
@@ -311,12 +364,7 @@ impl BinderDevice {
         code: u32,
         data: PayloadBuilder<'_>,
     ) -> Result<()> {
-        let handler = self
-            .objects
-            .get(id)
-            .ok_or(Error::ObjectNotFound)?
-            .upgrade()
-            .ok_or(Error::DeadBinder)?;
+        let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         tokio::spawn(async move {
             handler
@@ -538,15 +586,13 @@ unsafe fn binder_write_read(
                     unsafe { transaction.target.binder },
                     transaction.cookie,
                 );
-                let Some(handler_weak) = device.objects.get(&target) else {
-                    warn!("unable to find handler for: {target:x?}");
-                    return Some(Err(WriteReadError::ObjectNotFound));
+                let handler = {
+                    let Some(entry) = device.objects.get(&target) else {
+                        warn!("unable to find handler for: {target:x?}");
+                        return Some(Err(WriteReadError::ObjectNotFound));
+                    };
+                    entry.clone()
                 };
-                let Some(handler) = handler_weak.upgrade() else {
-                    warn!("handler for {target:x?} is dead");
-                    return Some(Err(WriteReadError::ObjectNotFound));
-                };
-                drop(handler_weak); // otherwise we hold 2 refs to the same dashmap entry and deadlock
                 let payload_reader = unsafe {
                     PayloadReader::from_kernel_raw(
                         device.clone(),
@@ -637,12 +683,12 @@ unsafe fn binder_write_read(
                 let target = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                let obj = device
-                    .objects
-                    .get(&BinderObjectId::from_raw(target.ptr, target.cookie))
-                    .and_then(|v| v.upgrade());
-                if let Some(obj) = obj {
-                    obj.strong_increase();
+                let id = BinderObjectId::from_raw(target.ptr, target.cookie);
+                if let Some(refstate) = device.object_refcounts.get(&id) {
+                    let v = refstate.strong_count.fetch_add(1, Ordering::Relaxed);
+                    if v == 0 {
+                        refstate.strong_count_not_zero.notify_waiters();
+                    }
                 }
                 _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &target)
                     .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
@@ -651,12 +697,12 @@ unsafe fn binder_write_read(
                 let target = unsafe {
                     read_from_slice::<BinderPtrCookie>(&read_slice[header..], &mut consumed)
                 };
-                let obj = device
-                    .objects
-                    .get(&BinderObjectId::from_raw(target.ptr, target.cookie))
-                    .and_then(|v| v.upgrade());
-                if let Some(obj) = obj {
-                    obj.strong_decrease();
+                let id = BinderObjectId::from_raw(target.ptr, target.cookie);
+                if let Some(refstate) = device.object_refcounts.get(&id) {
+                    let v = refstate.strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+                    if v == 0 {
+                        refstate.strong_count_hit_zero.notify_waiters();
+                    }
                 }
                 debug!("strong ref decrease");
             }
@@ -755,30 +801,7 @@ unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait DynBinderObject:
-    Any + TransactionTarget + Debug + Send + Sync + 'static
-{
-    async fn handle(&self, transaction: Transaction) -> PayloadBuilder;
+pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
+    async fn handle(&self, transaction: Transaction) -> PayloadBuilder<'_>;
     async fn handle_one_way(&self, transaction: Transaction);
-    fn strong_increase(&self);
-    fn strong_decrease(&self);
-    fn get_flat_binder_object(&self) -> FlatBinderObject;
-    fn device(&self) -> &Arc<BinderDevice>;
-    fn obj_hash(&self, state: &mut dyn Hasher);
-    fn obj_id(&self) -> &BinderObjectId;
-}
-
-pub trait TransactionHandler: Debug + Send + Sync + 'static {
-    type ObjectResource: Send + Sync + 'static + Debug + Default;
-    fn handle(
-        &self,
-        transaction: Transaction,
-        obj_res: &Self::ObjectResource,
-    ) -> impl std::future::Future<Output = PayloadBuilder<'_>> + std::marker::Send;
-
-    fn handle_one_way(
-        &self,
-        transaction: Transaction,
-        obj_res: &Self::ObjectResource,
-    ) -> impl std::future::Future<Output = ()> + std::marker::Send;
 }

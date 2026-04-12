@@ -1,31 +1,28 @@
-use std::{
-    fmt::Debug,
-    future::Future,
-    hash::{Hash, Hasher},
-    ops::Deref,
-    sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc, Weak,
-    },
-};
-
-use tokio::sync::Notify;
-use tracing::warn;
-
 use crate::{
-    device::{DynBinderObject, Transaction},
-    payload::PayloadBuilder,
     sys::{
         BinderCommand, BinderHandleCookie, BinderObjectHeader, BinderType, BinderUintptrT,
         FlatBinderFlags, FlatBinderObject, FlatBinderObjectData,
     },
     BinderDevice, TransactionHandler,
 };
+use std::{
+    any::Any,
+    fmt::Debug,
+    future::Future,
+    hash::Hash,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use tokio::sync::Notify;
+use tracing::warn;
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+#[derive(Debug)]
 pub enum BinderObjectOrRef {
-    Object(UntypedBinderObject),
+    Object(BorrowedBinderObject),
     WeakObject(WeakBinderObject),
     Ref(Arc<BinderRef>),
     WeakRef(Arc<WeakBinderRef>),
@@ -33,7 +30,7 @@ pub enum BinderObjectOrRef {
 impl BinderObjectOrRef {
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         match self {
-            BinderObjectOrRef::Object(p) => p.0.get_flat_binder_object(),
+            BinderObjectOrRef::Object(p) => p.get_flat_binder_object(),
             BinderObjectOrRef::Ref(p) => p.get_flat_binder_object(),
             BinderObjectOrRef::WeakRef(p) => p.get_flat_binder_object(),
             BinderObjectOrRef::WeakObject(p) => p.get_flat_binder_object(),
@@ -50,7 +47,7 @@ impl BinderObjectOrRef {
     }
     pub fn device(&self) -> &Arc<BinderDevice> {
         match self {
-            BinderObjectOrRef::Object(p) => p.device(),
+            BinderObjectOrRef::Object(p) => &p.device,
             BinderObjectOrRef::WeakObject(p) => &p.device,
             BinderObjectOrRef::Ref(p) => &p.device,
             BinderObjectOrRef::WeakRef(p) => &p.device,
@@ -259,88 +256,77 @@ pub struct BinderObjectId {
     pub(crate) cookie: BinderUintptrT,
 }
 
+impl BinderObjectId {
+    pub(crate) fn from_raw(binder: BinderUintptrT, cookie: BinderUintptrT) -> BinderObjectId {
+        Self { id: binder, cookie }
+    }
+}
+
+/// A borrowed reference to a local binder object, returned from payload decoding.
+/// Contains the handler Arc for downcasting.
 #[derive(Debug, Clone)]
-pub struct UntypedBinderObject(pub(crate) Arc<dyn DynBinderObject>);
-impl UntypedBinderObject {
-    pub fn downcast<H: TransactionHandler>(self) -> Option<Arc<BinderObject<H>>> {
-        Arc::downcast::<BinderObject<H>>(self.0).ok()
+pub struct BorrowedBinderObject {
+    pub(crate) device: Arc<BinderDevice>,
+    pub(crate) id: BinderObjectId,
+    pub(crate) handler: Arc<dyn TransactionHandler>,
+}
+
+impl BorrowedBinderObject {
+    pub fn id(&self) -> &BinderObjectId {
+        &self.id
     }
     pub fn device(&self) -> &Arc<BinderDevice> {
-        self.0.device()
+        &self.device
     }
-}
-
-impl Hash for UntypedBinderObject {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.obj_hash(state);
+    pub fn handler(&self) -> &Arc<dyn TransactionHandler> {
+        &self.handler
     }
-}
-impl PartialEq for UntypedBinderObject {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(self.device(), other.device()) && self.0.obj_id() == other.0.obj_id()
+    /// Downcast the handler to a concrete type by reference.
+    pub fn downcast_handler<T: TransactionHandler>(&self) -> Option<&T> {
+        (&*self.handler as &dyn Any).downcast_ref::<T>()
     }
-}
-
-impl Eq for UntypedBinderObject {}
-
-/// The owned/local side of a [`BinderRef`]
-#[derive(Debug)]
-pub struct BinderObject<H: TransactionHandler> {
-    device: Arc<BinderDevice>,
-    id: BinderObjectId,
-    strong_count_hit_zero: Notify,
-    strong_count_not_zero: Arc<Notify>,
-    strong_count: AtomicU32,
-    handler: H,
-    object_res: H::ObjectResource,
-}
-
-#[async_trait::async_trait]
-impl<T: TransactionHandler> DynBinderObject for BinderObject<T> {
-    async fn handle(&self, transaction: Transaction) -> PayloadBuilder {
-        self.handler.handle(transaction, &self.object_res).await
+    /// Downcast the handler Arc to a concrete type.
+    pub fn downcast_handler_arc<T: TransactionHandler>(&self) -> Option<Arc<T>> {
+        // trait_upcasting: Arc<dyn TransactionHandler> -> Arc<dyn Any> -> Arc<T>
+        let any_arc: Arc<dyn Any + Send + Sync> = self.handler.clone();
+        any_arc.downcast::<T>().ok()
     }
-
-    async fn handle_one_way(&self, transaction: Transaction) {
-        self.handler
-            .handle_one_way(transaction, &self.object_res)
-            .await
-    }
-
-    fn get_flat_binder_object(&self) -> FlatBinderObject {
+    pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         FlatBinderObject {
             hdr: BinderObjectHeader {
                 type_: BinderType::BINDER,
             },
-            // TODO: handle actual flags
             flags: FlatBinderFlags::ACCEPTS_FDS,
             data: FlatBinderObjectData { binder: self.id.id },
             cookie: self.id.cookie,
         }
     }
-    fn device(&self) -> &Arc<BinderDevice> {
-        &self.device
-    }
-    fn strong_increase(&self) {
-        let v = self.strong_count.fetch_add(1, Ordering::Relaxed);
-        if v == 0 {
-            self.strong_count_not_zero.notify_waiters();
-        }
-    }
-    fn strong_decrease(&self) {
-        let v = self.strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        // strong count hit 0
-        if v == 0 {
-            self.strong_count_hit_zero.notify_waiters();
-        }
-    }
-    fn obj_hash(&self, mut state: &mut dyn Hasher) {
-        self.hash(&mut state);
-    }
-    fn obj_id(&self) -> &BinderObjectId {
-        self.id()
+}
+
+impl Hash for BorrowedBinderObject {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.id.hash(state);
     }
 }
+impl PartialEq for BorrowedBinderObject {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl Eq for BorrowedBinderObject {}
+
+/// The owned/local side of a binder object — a capability guard.
+///
+/// Contains an Arc to the binder device, the object ID, and an Arc to the handler.
+/// When dropped, the object is unregistered from the device.
+#[derive(Debug)]
+pub struct BinderObject<T: TransactionHandler> {
+    pub(crate) device: Arc<BinderDevice>,
+    pub(crate) id: BinderObjectId,
+    pub(crate) handler: Arc<T>,
+}
+
 impl<H: TransactionHandler> Deref for BinderObject<H> {
     type Target = H;
 
@@ -353,47 +339,53 @@ impl<H: TransactionHandler> BinderObject<H> {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
-    /// Binder strong refs decreased to zero
+    /// Get the inner handler Arc for cloning/sharing.
+    pub fn handler_arc(&self) -> &Arc<H> {
+        &self.handler
+    }
+    /// Binder strong refs decreased to zero.
     pub async fn strong_refs_hit_zero(&self) {
-        self.strong_count_hit_zero.notified().await
-    }
-    /// Binder strong refs increased from zero to above zero
-    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self.strong_count_not_zero.clone();
-        async move { notify.notified().await }
-    }
-    pub(crate) fn new(id: usize, handler: H, device: Arc<BinderDevice>) -> Arc<Self> {
-        Self {
-            device,
-            id: BinderObjectId { id, cookie: 0 },
-            handler,
-            strong_count: AtomicU32::new(0),
-            strong_count_hit_zero: Notify::new(),
-            strong_count_not_zero: Arc::new(Notify::new()),
-            object_res: H::ObjectResource::default(),
+        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+            refstate.strong_count_hit_zero.notified().await;
         }
-        .into()
     }
-    pub(crate) fn new_cyclic(
-        id: usize,
-        f: impl FnOnce(&Weak<Self>) -> H,
-        device: Arc<BinderDevice>,
-    ) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self {
-            device,
-            id: BinderObjectId { id, cookie: 0 },
-            handler: f(weak),
-            strong_count: AtomicU32::new(0),
-            strong_count_hit_zero: Notify::new(),
-            strong_count_not_zero: Arc::new(Notify::new()),
-            object_res: H::ObjectResource::default(),
-        })
+    /// Binder strong refs increased from zero to above zero.
+    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_not_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
     }
 }
 impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}
 impl<H: TransactionHandler> TransactionTargetImpl for BinderObject<H> {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
         TransactionTargetHandle::Local(*self.id())
+    }
+}
+
+impl<T: TransactionHandler> Hash for BinderObject<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.device).hash(state);
+        self.id.hash(state);
+    }
+}
+impl<H: TransactionHandler> PartialEq for BinderObject<H> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
+    }
+}
+impl<H: TransactionHandler> Eq for BinderObject<H> {}
+
+impl<H: TransactionHandler> Drop for BinderObject<H> {
+    fn drop(&mut self) {
+        self.device.remove_binder_object(&self.id);
     }
 }
 
@@ -443,30 +435,6 @@ impl TransactionTargetImpl for WeakBinderObject {
     }
 }
 
-impl BinderObjectId {
-    pub(crate) fn from_raw(binder: BinderUintptrT, cookie: BinderUintptrT) -> BinderObjectId {
-        Self { id: binder, cookie }
-    }
-}
-
-impl<T: TransactionHandler> Hash for BinderObject<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.device).hash(state);
-        self.id.hash(state);
-    }
-}
-impl<H: TransactionHandler> PartialEq for BinderObject<H> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.device, &other.device) && self.id == other.id
-    }
-}
-impl<H: TransactionHandler> Eq for BinderObject<H> {}
-
-impl<H: TransactionHandler> Drop for BinderObject<H> {
-    fn drop(&mut self) {
-        self.device.remove_binder_object(&self.id);
-    }
-}
 #[allow(private_bounds)]
 pub trait TransactionTarget: TransactionTargetImpl {}
 pub(crate) enum TransactionTargetHandle {
@@ -493,7 +461,7 @@ impl TransactionTarget for BinderObjectOrRef {}
 impl TransactionTargetImpl for BinderObjectOrRef {
     fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
         match self {
-            BinderObjectOrRef::Object(v) => v.0.get_transaction_target_handle(),
+            BinderObjectOrRef::Object(v) => TransactionTargetHandle::Local(*v.id()),
             BinderObjectOrRef::WeakObject(v) => v.get_transaction_target_handle(),
             BinderObjectOrRef::Ref(v) => v.get_transaction_target_handle(),
             BinderObjectOrRef::WeakRef(v) => v.get_transaction_target_handle(),
@@ -503,9 +471,13 @@ impl TransactionTargetImpl for BinderObjectOrRef {
 pub trait ToBinderObjectOrRef: Send + Sync + 'static {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef;
 }
-impl<H: TransactionHandler> ToBinderObjectOrRef for Arc<BinderObject<H>> {
+impl<H: TransactionHandler> ToBinderObjectOrRef for BinderObject<H> {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
-        BinderObjectOrRef::Object(UntypedBinderObject(self.clone()))
+        BinderObjectOrRef::Object(BorrowedBinderObject {
+            device: self.device.clone(),
+            id: self.id,
+            handler: self.handler.clone(),
+        })
     }
 }
 impl ToBinderObjectOrRef for WeakBinderObject {
@@ -526,7 +498,7 @@ impl ToBinderObjectOrRef for Arc<WeakBinderRef> {
         BinderObjectOrRef::WeakRef(self.clone())
     }
 }
-impl ToBinderObjectOrRef for UntypedBinderObject {
+impl ToBinderObjectOrRef for BorrowedBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
         BinderObjectOrRef::Object(self.clone())
     }
