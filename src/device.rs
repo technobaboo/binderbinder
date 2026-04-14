@@ -19,9 +19,9 @@ use std::any::Any;
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::future::Future;
-use std::pin::Pin;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
+use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -153,7 +153,8 @@ impl BinderDevice {
             cookie: 0,
         };
 
-        self.objects.insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
+        self.objects
+            .insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
         self.object_refcounts.insert(id, ObjectRefState::new());
 
         BinderObject {
@@ -207,7 +208,10 @@ impl BinderDevice {
     }
 
     /// Get the handler for a given object ID (for payload decoding / downcasting).
-    pub(crate) fn get_handler(&self, id: &BinderObjectId) -> Option<Arc<dyn ErasedTransactionHandler>> {
+    pub(crate) fn get_handler(
+        &self,
+        id: &BinderObjectId,
+    ) -> Option<Arc<dyn ErasedTransactionHandler>> {
         self.objects.get(id).map(|v| v.value().clone())
     }
 
@@ -804,37 +808,35 @@ unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
 
 pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
     fn handle(
-        &self,
+        self: Arc<Self>,
         transaction: Transaction,
-    ) -> impl Future<Output = PayloadBuilder<'_>> + Send;
-    fn handle_one_way(
-        &self,
-        transaction: Transaction,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = PayloadBuilder<'static>> + Send;
+    fn handle_one_way(self: Arc<Self>, transaction: Transaction)
+        -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) trait ErasedTransactionHandler: Any + Debug + Send + Sync + 'static {
-    fn handle<'a>(
-        &'a self,
+    fn handle(
+        self: Arc<Self>,
         transaction: Transaction,
-    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'a>> + Send + 'a>>;
-    fn handle_one_way<'a>(
-        &'a self,
+    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'static>> + Send>>;
+    fn handle_one_way(
+        self: Arc<Self>,
         transaction: Transaction,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 impl<T: TransactionHandler> ErasedTransactionHandler for T {
-    fn handle<'a>(
-        &'a self,
+    fn handle(
+        self: Arc<Self>,
         transaction: Transaction,
-    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'a>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'static>> + Send>> {
         Box::pin(TransactionHandler::handle(self, transaction))
     }
-    fn handle_one_way<'a>(
-        &'a self,
+    fn handle_one_way(
+        self: Arc<Self>,
         transaction: Transaction,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(TransactionHandler::handle_one_way(self, transaction))
     }
 }

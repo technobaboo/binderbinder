@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use binderbinder::{
     device::Transaction,
     payload::{BinderObjectType, PayloadBuilder},
@@ -12,7 +14,7 @@ const ECHO_CODE: u32 = 1;
 #[derive(Debug)]
 pub struct EchoService;
 impl TransactionHandler for EchoService {
-    async fn handle(&self, mut transaction: Transaction) -> PayloadBuilder<'_> {
+    async fn handle(self: Arc<Self>, mut transaction: Transaction) -> PayloadBuilder<'static> {
         let mut builder = PayloadBuilder::new();
         if transaction.code != ECHO_CODE {
             builder.push_bytes(b"unknown transaction code");
@@ -51,7 +53,7 @@ impl TransactionHandler for EchoService {
         builder
     }
 
-    async fn handle_one_way(&self, _transaction: Transaction) {
+    async fn handle_one_way(self: Arc<Self>, _transaction: Transaction) {
         info!("got oneway transaction")
     }
 }
