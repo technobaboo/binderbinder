@@ -1,4 +1,5 @@
 use crate::{
+    device::ErasedTransactionHandler,
     sys::{
         BinderCommand, BinderHandleCookie, BinderObjectHeader, BinderType, BinderUintptrT,
         FlatBinderFlags, FlatBinderObject, FlatBinderObjectData,
@@ -20,7 +21,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BinderObjectOrRef {
     Object(BorrowedBinderObject),
     WeakObject(WeakBinderObject),
@@ -268,7 +269,7 @@ impl BinderObjectId {
 pub struct BorrowedBinderObject {
     pub(crate) device: Arc<BinderDevice>,
     pub(crate) id: BinderObjectId,
-    pub(crate) handler: Arc<dyn TransactionHandler>,
+    pub(crate) handler: Arc<dyn ErasedTransactionHandler>,
 }
 
 impl BorrowedBinderObject {
@@ -278,16 +279,15 @@ impl BorrowedBinderObject {
     pub fn device(&self) -> &Arc<BinderDevice> {
         &self.device
     }
-    pub fn handler(&self) -> &Arc<dyn TransactionHandler> {
-        &self.handler
-    }
     /// Downcast the handler to a concrete type by reference.
     pub fn downcast_handler<T: TransactionHandler>(&self) -> Option<&T> {
-        (&*self.handler as &dyn Any).downcast_ref::<T>()
+        // trait_upcasting: &dyn ErasedTransactionHandler -> &dyn Any -> &T
+        let any_ref: &dyn Any = &*self.handler;
+        any_ref.downcast_ref::<T>()
     }
     /// Downcast the handler Arc to a concrete type.
     pub fn downcast_handler_arc<T: TransactionHandler>(&self) -> Option<Arc<T>> {
-        // trait_upcasting: Arc<dyn TransactionHandler> -> Arc<dyn Any> -> Arc<T>
+        // trait_upcasting: Arc<dyn ErasedTransactionHandler> -> Arc<dyn Any + Send + Sync> -> Arc<T>
         let any_arc: Arc<dyn Any + Send + Sync> = self.handler.clone();
         any_arc.downcast::<T>().ok()
     }

@@ -18,6 +18,8 @@ use rustix::process::{self, RawPid, RawUid};
 use std::any::Any;
 use std::ffi::c_void;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
@@ -59,7 +61,7 @@ pub struct BinderDevice {
     pub(crate) object_id_counter: AtomicUsize,
     pub(crate) death_counter: AtomicUsize,
     _looper_threads: Vec<std::thread::JoinHandle<()>>,
-    pub(crate) objects: DashMap<BinderObjectId, Arc<dyn TransactionHandler>>,
+    pub(crate) objects: DashMap<BinderObjectId, Arc<dyn ErasedTransactionHandler>>,
     pub(crate) object_refcounts: DashMap<BinderObjectId, ObjectRefState>,
     pub(crate) retained_services: DashMap<BinderObjectId, Box<dyn Any + Send + Sync>>,
     pub(crate) refs: DashMap<u32, Weak<BinderRef>>,
@@ -151,7 +153,7 @@ impl BinderDevice {
             cookie: 0,
         };
 
-        self.objects.insert(id, handler.clone());
+        self.objects.insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
         self.object_refcounts.insert(id, ObjectRefState::new());
 
         BinderObject {
@@ -205,7 +207,7 @@ impl BinderDevice {
     }
 
     /// Get the handler for a given object ID (for payload decoding / downcasting).
-    pub fn get_handler(&self, id: &BinderObjectId) -> Option<Arc<dyn TransactionHandler>> {
+    pub(crate) fn get_handler(&self, id: &BinderObjectId) -> Option<Arc<dyn ErasedTransactionHandler>> {
         self.objects.get(id).map(|v| v.value().clone())
     }
 
@@ -800,8 +802,39 @@ unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
     ptr::read_unaligned(slice.as_ptr().cast())
 }
 
-#[async_trait::async_trait]
 pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
-    async fn handle(&self, transaction: Transaction) -> PayloadBuilder<'_>;
-    async fn handle_one_way(&self, transaction: Transaction);
+    fn handle(
+        &self,
+        transaction: Transaction,
+    ) -> impl Future<Output = PayloadBuilder<'_>> + Send;
+    fn handle_one_way(
+        &self,
+        transaction: Transaction,
+    ) -> impl Future<Output = ()> + Send;
+}
+
+pub(crate) trait ErasedTransactionHandler: Any + Debug + Send + Sync + 'static {
+    fn handle<'a>(
+        &'a self,
+        transaction: Transaction,
+    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'a>> + Send + 'a>>;
+    fn handle_one_way<'a>(
+        &'a self,
+        transaction: Transaction,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+impl<T: TransactionHandler> ErasedTransactionHandler for T {
+    fn handle<'a>(
+        &'a self,
+        transaction: Transaction,
+    ) -> Pin<Box<dyn Future<Output = PayloadBuilder<'a>> + Send + 'a>> {
+        Box::pin(TransactionHandler::handle(self, transaction))
+    }
+    fn handle_one_way<'a>(
+        &'a self,
+        transaction: Transaction,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(TransactionHandler::handle_one_way(self, transaction))
+    }
 }
