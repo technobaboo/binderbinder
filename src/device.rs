@@ -182,31 +182,6 @@ impl BinderDevice {
         self.register_object(handler)
     }
 
-    /// "Service mode": device holds the guard until strong refs hit zero.
-    /// Returns the handler Arc so the caller can still use it.
-    pub fn retain_as_service<T: TransactionHandler>(
-        self: &Arc<Self>,
-        guard: BinderObject<T>,
-    ) -> Arc<T> {
-        let handler = guard.handler.clone();
-        let id = guard.id;
-        let device = self.clone();
-
-        // Move guard into retained_services so it stays alive
-        self.retained_services.insert(id, Box::new(guard));
-
-        // Spawn a task to clean up when strong refs hit zero
-        tokio::spawn(async move {
-            if let Some(refstate) = device.object_refcounts.get(&id) {
-                refstate.strong_count_hit_zero.notified().await;
-            }
-            // Remove from retained_services, which drops the guard, which removes from objects
-            device.retained_services.remove(&id);
-        });
-
-        handler
-    }
-
     /// Get the handler for a given object ID (for payload decoding / downcasting).
     pub(crate) fn get_handler(
         &self,

@@ -362,6 +362,28 @@ impl<H: TransactionHandler> BinderObject<H> {
             }
         }
     }
+
+    /// "Service mode": device holds the guard until strong refs hit zero.
+    /// Returns the handler Arc so the caller can still use it.
+    pub fn to_service(self) -> Arc<H> {
+        let device = self.device.clone();
+        let id = self.id;
+        let handler = self.handler.clone();
+
+        // Move guard into retained_services so it stays alive
+        device.retained_services.insert(self.id, Box::new(self));
+
+        // Spawn a task to clean up when strong refs hit zero
+        tokio::spawn(async move {
+            if let Some(refstate) = device.object_refcounts.get(&id) {
+                refstate.strong_count_hit_zero.notified().await;
+            }
+            // Remove from retained_services, which drops the guard, which removes from objects
+            device.retained_services.remove(&id);
+        });
+
+        handler
+    }
 }
 impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}
 impl<H: TransactionHandler> TransactionTargetImpl for BinderObject<H> {
