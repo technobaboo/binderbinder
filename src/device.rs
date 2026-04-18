@@ -145,13 +145,14 @@ impl BinderDevice {
     /// unregistered from the device (RAII pattern).
     pub fn register_object<T: TransactionHandler>(
         self: &Arc<Self>,
-        handler: Arc<T>,
+        handler: impl Into<Arc<T>>,
     ) -> BinderObject<T> {
-        let cookie = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
+        let id = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
         let id = BinderObjectId {
-            id: cookie,
+            id,
             cookie: 0,
         };
+        let handler = handler.into();
 
         self.objects
             .insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
@@ -162,24 +163,6 @@ impl BinderDevice {
             id,
             handler,
         }
-    }
-
-    /// Like [`register_object`](Self::register_object), but wraps the handler in an Arc for you.
-    pub fn register_object_owned<T: TransactionHandler>(
-        self: &Arc<Self>,
-        handler: T,
-    ) -> BinderObject<T> {
-        self.register_object(Arc::new(handler))
-    }
-
-    /// Like [`register_object`](Self::register_object), but the closure receives a
-    /// `&Weak<T>` so the handler can store a weak self-reference.
-    pub fn register_object_cyclic<T: TransactionHandler>(
-        self: &Arc<Self>,
-        f: impl FnOnce(&Weak<T>) -> T,
-    ) -> BinderObject<T> {
-        let handler = Arc::new_cyclic(f);
-        self.register_object(handler)
     }
 
     /// Get the handler for a given object ID (for payload decoding / downcasting).
