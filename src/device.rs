@@ -41,14 +41,14 @@ pub struct Transaction {
 #[derive(Debug)]
 pub(crate) struct ObjectRefState {
     pub strong_count: AtomicU32,
-    pub strong_count_hit_zero: Notify,
+    pub strong_count_hit_zero: Arc<Notify>,
     pub strong_count_not_zero: Arc<Notify>,
 }
 impl ObjectRefState {
     pub fn new() -> Self {
         Self {
             strong_count: AtomicU32::new(0),
-            strong_count_hit_zero: Notify::new(),
+            strong_count_hit_zero: Arc::new(Notify::new()),
             strong_count_not_zero: Arc::new(Notify::new()),
         }
     }
@@ -148,10 +148,7 @@ impl BinderDevice {
         handler: impl Into<Arc<T>>,
     ) -> BinderObject<T> {
         let id = self.object_id_counter.fetch_add(1, Ordering::Relaxed);
-        let id = BinderObjectId {
-            id,
-            cookie: 0,
-        };
+        let id = BinderObjectId { id, cookie: 0 };
         let handler = handler.into();
 
         self.objects

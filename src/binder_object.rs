@@ -344,9 +344,16 @@ impl<H: TransactionHandler> BinderObject<H> {
         &self.handler
     }
     /// Binder strong refs decreased to zero.
-    pub async fn strong_refs_hit_zero(&self) {
-        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
-            refstate.strong_count_hit_zero.notified().await;
+    pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_hit_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
         }
     }
     /// Binder strong refs increased from zero to above zero.

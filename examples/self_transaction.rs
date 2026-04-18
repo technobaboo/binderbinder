@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Binder opened");
 
     info!("Setting context manager...");
-    let obj = device.register_object_owned(EchoService);
+    let obj = device.register_object(EchoService);
     device.set_context_manager(&obj).await?;
     info!("Context manager set!");
 
