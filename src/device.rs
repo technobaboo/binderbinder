@@ -584,7 +584,7 @@ unsafe fn binder_write_read(
                     )
                 };
                 if transaction.flags.contains(TransactionFlags::ONE_WAY) {
-                    runtime.block_on(handler.handle_one_way(Transaction {
+                    runtime.spawn(handler.handle_one_way(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
                         sender_pid: transaction.sender_pid,
