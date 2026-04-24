@@ -265,14 +265,45 @@ impl BinderObjectId {
 
 /// A borrowed reference to a local binder object, returned from payload decoding.
 /// Contains the handler Arc for downcasting.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BorrowedBinderObject {
-    pub(crate) device: Arc<BinderDevice>,
-    pub(crate) id: BinderObjectId,
-    pub(crate) handler: Arc<dyn ErasedTransactionHandler>,
+    device: Arc<BinderDevice>,
+    id: BinderObjectId,
+    handler: Arc<dyn ErasedTransactionHandler>,
+}
+
+impl Clone for BorrowedBinderObject {
+    fn clone(&self) -> Self {
+        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+            refstate.increase_local();
+        }
+        Self {
+            device: self.device.clone(),
+            id: self.id.clone(),
+            handler: self.handler.clone(),
+        }
+    }
+}
+impl Drop for BorrowedBinderObject {
+    fn drop(&mut self) {
+        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+            refstate.decrease_local();
+        }
+    }
 }
 
 impl BorrowedBinderObject {
+    pub(crate) fn from_id(dev: Arc<BinderDevice>, id: BinderObjectId) -> Option<Self> {
+        let handler = dev.get_handler(&id)?;
+        let refstate = dev.object_refcounts.get(&id)?;
+        refstate.increase_local();
+        drop(refstate);
+        Some(BorrowedBinderObject {
+            device: dev,
+            id,
+            handler,
+        })
+    }
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
@@ -439,6 +470,9 @@ impl PartialEq for WeakBinderObject {
 impl Eq for WeakBinderObject {}
 
 impl WeakBinderObject {
+    pub fn upgrade(&self) -> Option<BorrowedBinderObject> {
+        BorrowedBinderObject::from_id(self.device.clone(), self.id)
+    }
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
@@ -502,6 +536,9 @@ pub trait ToBinderObjectOrRef: Send + Sync + 'static {
 }
 impl<H: TransactionHandler> ToBinderObjectOrRef for BinderObject<H> {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        if let Some(ref_state) = self.device.object_refcounts.get(&self.id) {
+            ref_state.increase_local();
+        }
         BinderObjectOrRef::Object(BorrowedBinderObject {
             device: self.device.clone(),
             id: self.id,

@@ -265,15 +265,10 @@ impl PayloadReader {
         let object_or_ref = match flat_obj.hdr.type_ {
             BinderType::BINDER => {
                 let id = BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie);
-                let handler = self
-                    .device
-                    .get_handler(&id)
-                    .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?;
-                BinderObjectOrRef::Object(BorrowedBinderObject {
-                    device: self.device.clone(),
-                    id,
-                    handler,
-                })
+                BinderObjectOrRef::Object(
+                    BorrowedBinderObject::from_id(self.device.clone(), id)
+                        .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?,
+                )
             }
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
                 BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie),

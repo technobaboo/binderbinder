@@ -5,9 +5,10 @@ use crate::binder_object::{
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
 use crate::sys::{
-    self, BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderPtrCookie, BinderReturn,
-    BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx, BinderUintptrT,
-    BinderWriteRead, FlatBinderObject, SetContextMGR, SetMaxThreads, TransactionFlags,
+    self, BinderCommand, BinderExtendedError, BinderFrozenStateInfo, BinderObjectHeader,
+    BinderPtrCookie, BinderReturn, BinderSizeT, BinderTransactionData, BinderTransactionDataSecCtx,
+    BinderType, BinderUintptrT, BinderWriteRead, FlatBinderObject, SetContextMGR, SetMaxThreads,
+    TransactionFlags,
 };
 use core::slice;
 use dashmap::DashMap;
@@ -40,16 +41,51 @@ pub struct Transaction {
 
 #[derive(Debug)]
 pub(crate) struct ObjectRefState {
-    pub strong_count: AtomicU32,
-    pub strong_count_hit_zero: Arc<Notify>,
-    pub strong_count_not_zero: Arc<Notify>,
+    local_strong_count: AtomicU32,
+    remote_strong_count: AtomicU32,
+    new_in_remote: AtomicBool,
+    pub(crate) strong_count_hit_zero: Arc<Notify>,
+    pub(crate) strong_count_not_zero: Arc<Notify>,
 }
 impl ObjectRefState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            strong_count: AtomicU32::new(0),
+            local_strong_count: AtomicU32::new(0),
+            remote_strong_count: AtomicU32::new(0),
+            new_in_remote: AtomicBool::new(false),
             strong_count_hit_zero: Arc::new(Notify::new()),
             strong_count_not_zero: Arc::new(Notify::new()),
+        }
+    }
+    pub(crate) fn increase_local(&self) {
+        let v = self.local_strong_count.fetch_add(1, Ordering::Relaxed);
+        if v == 0 && self.remote_strong_count.load(Ordering::Relaxed) == 0 {
+            self.strong_count_not_zero.notify_waiters();
+        }
+    }
+    pub(crate) fn decrease_local(&self) {
+        let v = self.local_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        if v == 0
+            && self.remote_strong_count.load(Ordering::Relaxed) == 0
+            && !self.new_in_remote.load(Ordering::Relaxed)
+        {
+            self.strong_count_hit_zero.notify_waiters();
+        }
+    }
+    pub(crate) fn increase_remote(&self) {
+        let v = self.remote_strong_count.fetch_add(1, Ordering::Relaxed);
+        if v == 0
+            && self.local_strong_count.load(Ordering::Relaxed) == 0
+            && !self.new_in_remote.load(Ordering::Relaxed)
+        {
+            self.strong_count_not_zero.notify_waiters();
+        }
+        self.new_in_remote.store(false, Ordering::Relaxed);
+    }
+    pub(crate) fn decrease_remote(&self) {
+        let v = self.remote_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        if v == 0 && self.local_strong_count.load(Ordering::Relaxed) == 0 {
+            self.strong_count_hit_zero.notify_waiters();
         }
     }
 }
@@ -270,7 +306,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let reply = BinderTransactionData {
+        let transaction = BinderTransactionData {
             target: sys::TransactionTarget { handle },
             cookie: 0,
             code,
@@ -285,11 +321,12 @@ impl BinderDevice {
                 offsets: data.offset_buffer_ptr() as _,
             },
         };
+        unsafe { mark_objects_as_pending_remote(self, &transaction) };
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
         bytes.extend_from_slice(&BinderCommand::TRANSACTION.as_u32().to_ne_bytes());
         bytes.extend_from_slice(unsafe {
-            slice::from_raw_parts(&raw const reply as _, size_of_val(&reply))
+            slice::from_raw_parts(&raw const transaction as _, size_of_val(&transaction))
         });
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let mut write_data = Some(bytes.as_slice());
@@ -346,7 +383,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
-        let reply = BinderTransactionData {
+        let transaction = BinderTransactionData {
             target: sys::TransactionTarget { handle },
             cookie: 0,
             code,
@@ -361,11 +398,12 @@ impl BinderDevice {
                 offsets: data.offset_buffer_ptr() as _,
             },
         };
+        unsafe { mark_objects_as_pending_remote(self, &transaction) };
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
         bytes.extend_from_slice(&BinderCommand::TRANSACTION.as_u32().to_ne_bytes());
         bytes.extend_from_slice(unsafe {
-            slice::from_raw_parts(&raw const reply as _, size_of_val(&reply))
+            slice::from_raw_parts(&raw const transaction as _, size_of_val(&transaction))
         });
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let mut write_data = Some(bytes.as_slice());
@@ -413,6 +451,36 @@ impl Drop for BinderBackingMemMap {
     fn drop(&mut self) {
         unsafe {
             munmap(self.ptr, self.len).unwrap();
+        }
+    }
+}
+
+unsafe fn mark_objects_as_pending_remote(dev: &BinderDevice, transaction: &BinderTransactionData) {
+    let main_data =
+        slice::from_raw_parts(transaction.data.buffer as *const u8, transaction.data_size);
+    let offsets = slice::from_raw_parts(
+        transaction.data.offsets as *const usize,
+        transaction.offsets_size / size_of::<usize>(),
+    );
+    for offset in offsets {
+        let header_bytes = &main_data[*offset..offset + size_of::<BinderObjectHeader>()];
+        let header =
+            unsafe { ptr::read_unaligned(header_bytes.as_ptr() as *const BinderObjectHeader) };
+        match header.type_ {
+            BinderType::BINDER => {
+                let binder_obj_bytes = &main_data[*offset..offset + size_of::<FlatBinderObject>()];
+                let flat_obj = binder_obj_bytes.as_ptr() as *const FlatBinderObject;
+                let flat_obj = unsafe { flat_obj.as_ref().unwrap() };
+                let id = BinderObjectId::from_raw(flat_obj.data.binder, flat_obj.cookie);
+                if let Some(refcount) = dev.object_refcounts.get(&id) {
+                    if refcount.remote_strong_count.load(Ordering::Relaxed) == 0 {
+                        refcount.new_in_remote.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            _ => {
+                continue;
+            }
         }
     }
 }
@@ -646,10 +714,7 @@ unsafe fn binder_write_read(
                 };
                 let id = BinderObjectId::from_raw(target.ptr, target.cookie);
                 if let Some(refstate) = device.object_refcounts.get(&id) {
-                    let v = refstate.strong_count.fetch_add(1, Ordering::Relaxed);
-                    if v == 0 {
-                        refstate.strong_count_not_zero.notify_waiters();
-                    }
+                    refstate.increase_remote();
                 }
                 _ = write_binder_struct_command(dev_fd, BinderCommand::ACQUIRE_DONE, &target)
                     .inspect_err(|err| error!("failed to send ACQUIRE_DONE: {err}"));
@@ -660,10 +725,7 @@ unsafe fn binder_write_read(
                 };
                 let id = BinderObjectId::from_raw(target.ptr, target.cookie);
                 if let Some(refstate) = device.object_refcounts.get(&id) {
-                    let v = refstate.strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-                    if v == 0 {
-                        refstate.strong_count_hit_zero.notify_waiters();
-                    }
+                    refstate.decrease_remote();
                 }
                 debug!("strong ref decrease");
             }
