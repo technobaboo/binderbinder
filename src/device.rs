@@ -1,6 +1,6 @@
 use crate::binder_object::{
-    BinderObject, BinderObjectId, BinderRef, ContextManagerBinderRef, TransactionTarget,
-    WeakBinderRef,
+    BinderObject, BinderObjectId, BinderObjectRef, BinderRef, ContextManagerBinderRef,
+    TransactionTarget, WeakBinderRef,
 };
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
@@ -191,11 +191,8 @@ impl BinderDevice {
             .insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
         self.object_refcounts.insert(id, ObjectRefState::new());
 
-        BinderObject {
-            device: self.clone(),
-            id,
-            handler,
-        }
+        let inner_ref = BinderObjectRef::from_id(self.clone(), id).expect("unreachable");
+        BinderObject { inner_ref }
     }
 
     /// Get the handler for a given object ID (for payload decoding / downcasting).

@@ -284,6 +284,12 @@ impl Clone for BorrowedBinderObject {
         }
     }
 }
+impl TransactionTarget for BorrowedBinderObject {}
+impl TransactionTargetImpl for BorrowedBinderObject {
+    fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
+        TransactionTargetHandle::Local(self.id)
+    }
+}
 impl Drop for BorrowedBinderObject {
     fn drop(&mut self) {
         if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
@@ -322,6 +328,9 @@ impl BorrowedBinderObject {
         let any_arc: Arc<dyn Any + Send + Sync> = self.handler.clone();
         any_arc.downcast::<T>().ok()
     }
+    pub fn downcast<T: TransactionHandler>(&self) -> Option<BinderObjectRef<T>> {
+        BinderObjectRef::from_id(self.device.clone(), self.id)
+    }
     pub(crate) fn get_flat_binder_object(&self) -> FlatBinderObject {
         FlatBinderObject {
             hdr: BinderObjectHeader {
@@ -353,19 +362,22 @@ impl Eq for BorrowedBinderObject {}
 /// When dropped, the object is unregistered from the device.
 #[derive(Debug)]
 pub struct BinderObject<T: TransactionHandler> {
-    pub(crate) device: Arc<BinderDevice>,
-    pub(crate) id: BinderObjectId,
-    pub(crate) handler: Arc<T>,
+    pub(crate) inner_ref: BinderObjectRef<T>,
 }
 
 impl<H: TransactionHandler> Deref for BinderObject<H> {
-    type Target = H;
+    type Target = BinderObjectRef<H>;
 
     fn deref(&self) -> &Self::Target {
-        &self.handler
+        &self.inner_ref
     }
 }
 
+impl<H: TransactionHandler> AsRef<BinderObjectRef<H>> for BinderObject<H> {
+    fn as_ref(&self) -> &BinderObjectRef<H> {
+        &self.inner_ref
+    }
+}
 impl<H: TransactionHandler> BinderObject<H> {
     pub fn id(&self) -> &BinderObjectId {
         &self.id
@@ -403,24 +415,29 @@ impl<H: TransactionHandler> BinderObject<H> {
 
     /// "Service mode": device holds the guard until strong refs hit zero.
     /// Returns the handler Arc so the caller can still use it.
-    pub fn to_service(self) -> Arc<H> {
-        let device = self.device.clone();
+    pub fn to_service(self) -> BinderObjectRef<H> {
+        let device = self.inner_ref.device.clone();
         let id = self.id;
-        let handler = self.handler.clone();
+        let _handler = self.handler.clone();
 
         // Move guard into retained_services so it stays alive
         device.retained_services.insert(self.id, Box::new(self));
+        let obj_ref =
+            BinderObjectRef::from_id(device.clone(), id).expect("holding all required refs");
 
         // Spawn a task to clean up when strong refs hit zero
         tokio::spawn(async move {
-            if let Some(refstate) = device.object_refcounts.get(&id) {
-                refstate.strong_count_hit_zero.notified().await;
+            let hit_zero_arc = device
+                .object_refcounts
+                .get(&id)
+                .map(|v| v.strong_count_hit_zero.clone());
+            if let Some(notify) = hit_zero_arc {
+                notify.notified().await;
             }
             // Remove from retained_services, which drops the guard, which removes from objects
             device.retained_services.remove(&id);
         });
-
-        handler
+        obj_ref
     }
 }
 impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}
@@ -546,6 +563,73 @@ impl<H: TransactionHandler> ToBinderObjectOrRef for BinderObject<H> {
         })
     }
 }
+/// A borrowed ref to an owned BinderObject, basically a typed version of BorrowedBinderObject
+#[derive(Debug)]
+pub struct BinderObjectRef<H: TransactionHandler> {
+    device: Arc<BinderDevice>,
+    id: BinderObjectId,
+    handler: Arc<H>,
+}
+impl<T: TransactionHandler> Deref for BinderObjectRef<T> {
+    type Target = Arc<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.handler()
+    }
+}
+impl<T: TransactionHandler> Clone for BinderObjectRef<T> {
+    fn clone(&self) -> Self {
+        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+            refstate.increase_local();
+        }
+        Self {
+            device: self.device.clone(),
+            id: self.id.clone(),
+            handler: self.handler.clone(),
+        }
+    }
+}
+impl<T: TransactionHandler> TransactionTarget for BinderObjectRef<T> {}
+impl<T: TransactionHandler> TransactionTargetImpl for BinderObjectRef<T> {
+    fn get_transaction_target_handle(&self) -> TransactionTargetHandle {
+        TransactionTargetHandle::Local(self.id)
+    }
+}
+impl<T: TransactionHandler> Drop for BinderObjectRef<T> {
+    fn drop(&mut self) {
+        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+            refstate.decrease_local();
+        }
+    }
+}
+
+impl<H: TransactionHandler> BinderObjectRef<H> {
+    pub(crate) fn from_id(dev: Arc<BinderDevice>, id: BinderObjectId) -> Option<Self> {
+        let handler: Arc<dyn Any + Send + Sync> = dev.get_handler(&id)?;
+        let handler = handler.downcast().ok()?;
+        let refstate = dev.object_refcounts.get(&id)?;
+        refstate.increase_local();
+        drop(refstate);
+        Some(BinderObjectRef {
+            device: dev,
+            id,
+            handler,
+        })
+    }
+    pub fn handler(&self) -> &Arc<H> {
+        &self.handler
+    }
+    pub fn as_erased(&self) -> BorrowedBinderObject {
+        BorrowedBinderObject::from_id(self.device.clone(), self.id)
+            .expect("holding the same refs as expected, should be unreachable")
+    }
+    pub fn id(&self) -> &BinderObjectId {
+        &self.id
+    }
+    pub fn device(&self) -> &Arc<BinderDevice> {
+        &self.device
+    }
+}
 impl ToBinderObjectOrRef for WeakBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
         BinderObjectOrRef::WeakObject(WeakBinderObject {
@@ -567,6 +651,11 @@ impl ToBinderObjectOrRef for Arc<WeakBinderRef> {
 impl ToBinderObjectOrRef for BorrowedBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
         BinderObjectOrRef::Object(self.clone())
+    }
+}
+impl<T: TransactionHandler> ToBinderObjectOrRef for BinderObjectRef<T> {
+    fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        BinderObjectOrRef::Object(self.as_erased())
     }
 }
 impl ToBinderObjectOrRef for BinderObjectOrRef {
