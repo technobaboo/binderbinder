@@ -379,40 +379,6 @@ impl<H: TransactionHandler> AsRef<BinderObjectRef<H>> for BinderObject<H> {
     }
 }
 impl<H: TransactionHandler> BinderObject<H> {
-    pub fn id(&self) -> &BinderObjectId {
-        &self.id
-    }
-    /// Get the inner handler Arc for cloning/sharing.
-    pub fn handler_arc(&self) -> &Arc<H> {
-        &self.handler
-    }
-    /// Binder strong refs decreased to zero.
-    pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_hit_zero.clone());
-        async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
-            }
-        }
-    }
-    /// Binder strong refs increased from zero to above zero.
-    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_not_zero.clone());
-        async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
-            }
-        }
-    }
-
     /// "Service mode": device holds the guard until strong refs hit zero.
     /// Returns the handler Arc so the caller can still use it.
     pub fn to_service(self) -> BinderObjectRef<H> {
@@ -574,7 +540,7 @@ impl<T: TransactionHandler> Deref for BinderObjectRef<T> {
     type Target = Arc<T>;
 
     fn deref(&self) -> &Self::Target {
-        self.handler()
+        self.handler_arc()
     }
 }
 impl<T: TransactionHandler> Clone for BinderObjectRef<T> {
@@ -616,7 +582,34 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
             handler,
         })
     }
-    pub fn handler(&self) -> &Arc<H> {
+    /// Binder strong refs decreased to zero.
+    pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_hit_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
+    }
+    /// Binder strong refs increased from zero to above zero.
+    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_not_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
+    }
+    /// Get the inner handler Arc for cloning/sharing.
+    pub fn handler_arc(&self) -> &Arc<H> {
         &self.handler
     }
     pub fn as_erased(&self) -> BorrowedBinderObject {
