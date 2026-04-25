@@ -362,29 +362,26 @@ impl Eq for BorrowedBinderObject {}
 /// When dropped, the object is unregistered from the device.
 #[derive(Debug)]
 pub struct BinderObject<T: TransactionHandler> {
-    pub(crate) inner_ref: BinderObjectRef<T>,
+    pub(crate) device: Arc<BinderDevice>,
+    pub(crate) id: BinderObjectId,
+    pub(crate) handler: Arc<T>,
 }
 
 impl<H: TransactionHandler> Deref for BinderObject<H> {
-    type Target = BinderObjectRef<H>;
+    type Target = Arc<H>;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner_ref
+        &self.handler
     }
 }
 
-impl<H: TransactionHandler> AsRef<BinderObjectRef<H>> for BinderObject<H> {
-    fn as_ref(&self) -> &BinderObjectRef<H> {
-        &self.inner_ref
-    }
-}
 impl<H: TransactionHandler> BinderObject<H> {
     /// "Service mode": device holds the guard until strong refs hit zero.
     /// Returns the handler Arc so the caller can still use it.
     pub fn to_service(self) -> BinderObjectRef<H> {
-        let device = self.inner_ref.device.clone();
+        let device = self.device.clone();
         let id = self.id;
-        let _handler = self.handler.clone();
+        let _handler = self.clone();
 
         // Move guard into retained_services so it stays alive
         device.retained_services.insert(self.id, Box::new(self));
@@ -404,6 +401,42 @@ impl<H: TransactionHandler> BinderObject<H> {
             device.retained_services.remove(&id);
         });
         obj_ref
+    }
+    /// Binder strong refs decreased to zero.
+    pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_hit_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
+    }
+    /// Binder strong refs increased from zero to above zero.
+    pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
+        let notify = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.strong_count_not_zero.clone());
+        async move {
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
+    }
+    /// Get the inner handler Arc for cloning/sharing.
+    pub fn handler_arc(&self) -> &Arc<H> {
+        &self.handler
+    }
+    pub fn id(&self) -> &BinderObjectId {
+        &self.id
+    }
+    pub fn device(&self) -> &Arc<BinderDevice> {
+        &self.device
     }
 }
 impl<H: TransactionHandler> TransactionTarget for BinderObject<H> {}
@@ -623,6 +656,13 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
         &self.device
     }
 }
+trait Seal {}
+#[expect(private_bounds)]
+pub trait OwnedBinderObjectRefTrait<T: TransactionHandler>: ToBinderObjectOrRef + Seal {}
+impl<T: TransactionHandler> Seal for BinderObject<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectRefTrait<T> for BinderObject<T> {}
+impl<T: TransactionHandler> Seal for BinderObjectRef<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectRefTrait<T> for BinderObjectRef<T> {}
 impl ToBinderObjectOrRef for WeakBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
         BinderObjectOrRef::WeakObject(WeakBinderObject {

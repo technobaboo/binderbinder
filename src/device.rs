@@ -1,6 +1,6 @@
 use crate::binder_object::{
-    BinderObject, BinderObjectId, BinderObjectRef, BinderRef, ContextManagerBinderRef,
-    TransactionTarget, WeakBinderRef,
+    BinderObject, BinderObjectId, BinderRef, ContextManagerBinderRef, TransactionTarget,
+    WeakBinderRef,
 };
 use crate::error::{Error, Result};
 use crate::payload::{PayloadBuilder, PayloadReader};
@@ -41,6 +41,7 @@ pub struct Transaction {
 
 #[derive(Debug)]
 pub(crate) struct ObjectRefState {
+    obj_id: BinderObjectId,
     local_strong_count: AtomicU32,
     remote_strong_count: AtomicU32,
     new_in_remote: AtomicBool,
@@ -48,8 +49,9 @@ pub(crate) struct ObjectRefState {
     pub(crate) strong_count_not_zero: Arc<Notify>,
 }
 impl ObjectRefState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(obj_id: BinderObjectId) -> Self {
         Self {
+            obj_id,
             local_strong_count: AtomicU32::new(0),
             remote_strong_count: AtomicU32::new(0),
             new_in_remote: AtomicBool::new(false),
@@ -59,32 +61,40 @@ impl ObjectRefState {
     }
     pub(crate) fn increase_local(&self) {
         let v = self.local_strong_count.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v + 1,"increasing local strong ref");
         if v == 0 && self.remote_strong_count.load(Ordering::Relaxed) == 0 {
+            tracing::debug!(?self.obj_id, "sending strong not zero from local");
             self.strong_count_not_zero.notify_waiters();
         }
     }
     pub(crate) fn decrease_local(&self) {
         let v = self.local_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        tracing::debug!(?self.obj_id, new_count = v,"decreasing local strong ref");
         if v == 0
             && self.remote_strong_count.load(Ordering::Relaxed) == 0
             && !self.new_in_remote.load(Ordering::Relaxed)
         {
+            tracing::debug!(?self.obj_id,"sending strong hit zero from local");
             self.strong_count_hit_zero.notify_waiters();
         }
     }
     pub(crate) fn increase_remote(&self) {
         let v = self.remote_strong_count.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v + 1,"increasing remote strong ref");
         if v == 0
             && self.local_strong_count.load(Ordering::Relaxed) == 0
             && !self.new_in_remote.load(Ordering::Relaxed)
         {
+            tracing::debug!(?self.obj_id,"sending strong not zero from remote");
             self.strong_count_not_zero.notify_waiters();
         }
         self.new_in_remote.store(false, Ordering::Relaxed);
     }
     pub(crate) fn decrease_remote(&self) {
         let v = self.remote_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        tracing::debug!(?self.obj_id, new_count = v,"decreasing remote strong ref");
         if v == 0 && self.local_strong_count.load(Ordering::Relaxed) == 0 {
+            tracing::debug!(?self.obj_id,"sending strong hit zero from remote");
             self.strong_count_hit_zero.notify_waiters();
         }
     }
@@ -189,10 +199,13 @@ impl BinderDevice {
 
         self.objects
             .insert(id, handler.clone() as Arc<dyn ErasedTransactionHandler>);
-        self.object_refcounts.insert(id, ObjectRefState::new());
+        self.object_refcounts.insert(id, ObjectRefState::new(id));
 
-        let inner_ref = BinderObjectRef::from_id(self.clone(), id).expect("unreachable");
-        BinderObject { inner_ref }
+        BinderObject {
+            device: self.clone(),
+            id,
+            handler,
+        }
     }
 
     /// Get the handler for a given object ID (for payload decoding / downcasting).
@@ -469,10 +482,16 @@ unsafe fn mark_objects_as_pending_remote(dev: &BinderDevice, transaction: &Binde
                 let flat_obj = binder_obj_bytes.as_ptr() as *const FlatBinderObject;
                 let flat_obj = unsafe { flat_obj.as_ref().unwrap() };
                 let id = BinderObjectId::from_raw(flat_obj.data.binder, flat_obj.cookie);
+                tracing::trace!(?id, "found binder object id in transaction");
                 if let Some(refcount) = dev.object_refcounts.get(&id) {
                     if refcount.remote_strong_count.load(Ordering::Relaxed) == 0 {
                         refcount.new_in_remote.store(true, Ordering::Relaxed);
                     }
+                } else {
+                    tracing::warn!(
+                        ?id,
+                        "binder object found in transaction but it has no refcounts"
+                    );
                 }
             }
             _ => {
@@ -614,7 +633,7 @@ unsafe fn binder_write_read(
                 );
                 let handler = {
                     let Some(entry) = device.objects.get(&target) else {
-                        warn!("unable to find handler for: {target:x?}");
+                        warn!("unable to find handler for: {target:?}");
                         return Some(Err(WriteReadError::ObjectNotFound));
                     };
                     entry.clone()
