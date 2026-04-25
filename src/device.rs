@@ -759,7 +759,7 @@ unsafe fn binder_write_read(
                 debug!("attempt strong ref increase, should be unused i think?");
             }
             BinderReturn::NOOP => {
-                trace!("noop?");
+                // trace!("noop?");
             }
             BinderReturn::SPAWN_LOOPER => {
                 let device = Arc::downgrade(&device);

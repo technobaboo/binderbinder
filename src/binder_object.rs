@@ -292,6 +292,7 @@ impl TransactionTargetImpl for BorrowedBinderObject {
 }
 impl Drop for BorrowedBinderObject {
     fn drop(&mut self) {
+        tracing::trace!(?self.id, "Dropping BorrowedBinderObject");
         if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
             refstate.decrease_local();
         }
@@ -461,6 +462,7 @@ impl<H: TransactionHandler> Eq for BinderObject<H> {}
 
 impl<H: TransactionHandler> Drop for BinderObject<H> {
     fn drop(&mut self) {
+        tracing::trace!(?self.id, "Dropping BinderObject");
         self.device.remove_binder_object(&self.id);
     }
 }
@@ -596,6 +598,7 @@ impl<T: TransactionHandler> TransactionTargetImpl for BinderObjectRef<T> {
 }
 impl<T: TransactionHandler> Drop for BinderObjectRef<T> {
     fn drop(&mut self) {
+        tracing::trace!(?self.id, "Dropping BinderObjectRef");
         if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
             refstate.decrease_local();
         }

@@ -26,6 +26,7 @@ pub struct PayloadBuilder<'a> {
     obj_offsets: Vec<usize>,
     buffer_fd_lifetime: PhantomData<&'a ()>,
     owned_fds: Vec<OwnedFd>,
+    binder_objects: Vec<BinderObjectOrRef>,
 }
 impl<'a> Default for PayloadBuilder<'a> {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl<'a> PayloadBuilder<'a> {
             obj_offsets: Vec::new(),
             buffer_fd_lifetime: PhantomData,
             owned_fds: Vec::new(),
+            binder_objects: Vec::new(),
         }
     }
     /// data copied
@@ -58,6 +60,7 @@ impl<'a> PayloadBuilder<'a> {
             )
         };
         self.data.extend_from_slice(slice);
+        self.binder_objects.push(port);
     }
     pub fn push_fd<'fd: 'a>(&mut self, fd: BorrowedFd<'fd>, cookie: usize) {
         self.align(align_of::<BinderFdObject>());
