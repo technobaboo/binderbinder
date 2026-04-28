@@ -101,7 +101,6 @@ impl ObjectRefState {
 }
 
 /// Shared binder device state.
-#[derive(Debug)]
 pub struct BinderDevice {
     fd: Arc<OwnedFd>,
     pub(crate) object_id_counter: AtomicUsize,
@@ -116,6 +115,34 @@ pub struct BinderDevice {
     ctx_manager: ContextManagerBinderRef,
     // needed for safety
     _backing: BinderBackingMemMap,
+}
+
+impl Debug for BinderDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderDevice")
+            // TODO: get rid of this alloc
+            .field(
+                "objects",
+                &self.objects.iter().map(|o| *o.key()).collect::<Vec<_>>(),
+            )
+            .field(
+                "retained_services",
+                &self
+                    .retained_services
+                    .iter()
+                    .map(|o| *o.key())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "refs",
+                &self.refs.iter().map(|o| *o.key()).collect::<Vec<_>>(),
+            )
+            .field(
+                "weak_refs",
+                &self.weak_refs.iter().map(|o| *o.key()).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl BinderDevice {
@@ -356,7 +383,7 @@ impl BinderDevice {
                     break Err(Error::ObjectNotFound);
                 }
                 Some(Err(WriteReadError::FailedReply)) => {
-                    error!("{}", WriteReadError::FailedReply);
+                    error!("remote twoway {}", WriteReadError::FailedReply);
                     break Err(Error::Unknown(1));
                 }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
@@ -426,7 +453,7 @@ impl BinderDevice {
             Some(Err(WriteReadError::DeadReply)) => Error::DeadReply,
             Some(Err(WriteReadError::ObjectNotFound)) => Error::ObjectNotFound,
             Some(Err(WriteReadError::FailedReply)) => {
-                error!("{}", WriteReadError::FailedReply);
+                error!("remote transact oneway {}", WriteReadError::FailedReply);
                 Error::Unknown(1)
             }
             Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => Error::Binder(err),
@@ -551,7 +578,7 @@ fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: 
             Some(Err(WriteReadError::DeadReply)) => {}
             Some(Err(WriteReadError::ObjectNotFound)) => {}
             Some(Err(WriteReadError::FailedReply)) => {
-                error!("{}", WriteReadError::FailedReply);
+                error!("looper {}", WriteReadError::FailedReply);
             }
             Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                 error!("WriteRead failed: {err}");

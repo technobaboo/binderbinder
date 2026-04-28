@@ -57,10 +57,18 @@ impl BinderObjectOrRef {
 }
 
 /// The remote side of a [`BinderObject`]
-#[derive(Debug)]
 pub struct BinderRef {
     device: Arc<BinderDevice>,
     weak: Arc<WeakBinderRef>,
+}
+
+impl Debug for BinderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderRef")
+            .field("id", &self.id)
+            .field("dead", &self.dead)
+            .finish()
+    }
 }
 impl Hash for BinderRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -137,12 +145,20 @@ impl Drop for BinderRef {
 }
 
 /// Weak version of [`BinderRef`]
-#[derive(Debug)]
 pub struct WeakBinderRef {
     device: Arc<BinderDevice>,
     id: u32,
     dead: Arc<AtomicBool>,
     death_notify: Arc<Notify>,
+}
+
+impl Debug for WeakBinderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakBinderRef")
+            .field("id", &self.id)
+            .field("dead", &self.dead)
+            .finish()
+    }
 }
 
 impl Hash for WeakBinderRef {
@@ -265,11 +281,18 @@ impl BinderObjectId {
 
 /// A borrowed reference to a local binder object, returned from payload decoding.
 /// Contains the handler Arc for downcasting.
-#[derive(Debug)]
 pub struct BorrowedBinderObject {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
     handler: Arc<dyn ErasedTransactionHandler>,
+}
+
+impl Debug for BorrowedBinderObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedBinderObject")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl Clone for BorrowedBinderObject {
@@ -361,11 +384,18 @@ impl Eq for BorrowedBinderObject {}
 ///
 /// Contains an Arc to the binder device, the object ID, and an Arc to the handler.
 /// When dropped, the object is unregistered from the device.
-#[derive(Debug)]
 pub struct BinderObject<T: TransactionHandler> {
     pub(crate) device: Arc<BinderDevice>,
     pub(crate) id: BinderObjectId,
     pub(crate) handler: Arc<T>,
+}
+
+impl<T: TransactionHandler + Debug> Debug for BinderObject<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderObject")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl<H: TransactionHandler> Deref for BinderObject<H> {
@@ -468,10 +498,18 @@ impl<H: TransactionHandler> Drop for BinderObject<H> {
 }
 
 /// Only returned if a remote process sends a [`WeakBinderRef`] to the process owning the [`BinderObject`]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WeakBinderObject {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
+}
+
+impl Debug for WeakBinderObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakBinderObject")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl Hash for WeakBinderObject {
@@ -565,11 +603,18 @@ impl<H: TransactionHandler> ToBinderObjectOrRef for BinderObject<H> {
     }
 }
 /// A borrowed ref to an owned BinderObject, basically a typed version of BorrowedBinderObject
-#[derive(Debug)]
 pub struct BinderObjectRef<H: TransactionHandler> {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
     handler: Arc<H>,
+}
+
+impl<H: TransactionHandler + Debug> Debug for BinderObjectRef<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinderObjectRef")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 impl<T: TransactionHandler> Deref for BinderObjectRef<T> {
     type Target = Arc<T>;
