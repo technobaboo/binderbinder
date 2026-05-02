@@ -34,6 +34,9 @@ use tracing::{debug, error, info, trace, warn};
 
 pub struct Transaction {
     pub code: u32,
+    /// you need to drop the transaction payload for oneway transactions to be counted as "handled",
+    /// please whatever you do, if you're in a oneway transaction handler copy the data out as soon as absolutly possible and drop the
+    /// payload, else this will cause deadlocks and freeze, please, trust me
     pub payload: PayloadReader,
     pub sender_pid: RawPid,
     pub sender_euid: RawUid,
@@ -871,6 +874,9 @@ pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
         self: Arc<Self>,
         transaction: Transaction,
     ) -> impl Future<Output = PayloadBuilder<'static>> + Send;
+    /// you need to drop the transaction payload for the transaction to be counted as "handled",
+    /// please whatever you do, copy the data out as soon as absolutly possible and drop the
+    /// payload, else this will cause deadlocks and freeze, please, trust me
     fn handle_one_way(self: Arc<Self>, transaction: Transaction)
         -> impl Future<Output = ()> + Send;
 }
