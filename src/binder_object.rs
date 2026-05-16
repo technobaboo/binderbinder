@@ -706,7 +706,11 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
 }
 trait Seal {}
 #[expect(private_bounds)]
-pub trait OwnedBinderObjectRefTrait<T: TransactionHandler>: ToBinderObjectOrRef + Seal {}
+pub trait OwnedBinderObjectRefTrait<T: TransactionHandler>: ToBinderObjectOrRef + Seal {
+    fn to_object_or_ref(&self) -> BinderObjectOrRef {
+        self.to_binder_object_or_ref()
+    }
+}
 impl<T: TransactionHandler> Seal for BinderObject<T> {}
 impl<T: TransactionHandler> OwnedBinderObjectRefTrait<T> for BinderObject<T> {}
 impl<T: TransactionHandler> Seal for BinderObjectRef<T> {}
