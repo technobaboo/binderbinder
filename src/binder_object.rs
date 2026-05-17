@@ -302,7 +302,7 @@ impl Clone for BorrowedBinderObject {
         }
         Self {
             device: self.device.clone(),
-            id: self.id.clone(),
+            id: self.id,
             handler: self.handler.clone(),
         }
     }
@@ -630,7 +630,7 @@ impl<T: TransactionHandler> Clone for BinderObjectRef<T> {
         }
         Self {
             device: self.device.clone(),
-            id: self.id.clone(),
+            id: self.id,
             handler: self.handler.clone(),
         }
     }
