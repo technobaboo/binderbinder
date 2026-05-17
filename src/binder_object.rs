@@ -302,7 +302,7 @@ impl Clone for BorrowedBinderObject {
         }
         Self {
             device: self.device.clone(),
-            id: self.id.clone(),
+            id: self.id,
             handler: self.handler.clone(),
         }
     }
@@ -630,7 +630,7 @@ impl<T: TransactionHandler> Clone for BinderObjectRef<T> {
         }
         Self {
             device: self.device.clone(),
-            id: self.id.clone(),
+            id: self.id,
             handler: self.handler.clone(),
         }
     }
@@ -704,17 +704,17 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
         &self.device
     }
 }
-trait Seal {}
+trait OwnedBinderObjectSeal {}
 #[expect(private_bounds)]
-pub trait OwnedBinderObjectRefTrait<T: TransactionHandler>: ToBinderObjectOrRef + Seal {
+pub trait OwnedBinderObjectRef: ToBinderObjectOrRef + OwnedBinderObjectSeal {
     fn to_object_or_ref(&self) -> BinderObjectOrRef {
         self.to_binder_object_or_ref()
     }
 }
-impl<T: TransactionHandler> Seal for BinderObject<T> {}
-impl<T: TransactionHandler> OwnedBinderObjectRefTrait<T> for BinderObject<T> {}
-impl<T: TransactionHandler> Seal for BinderObjectRef<T> {}
-impl<T: TransactionHandler> OwnedBinderObjectRefTrait<T> for BinderObjectRef<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectSeal for BinderObject<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectRef for BinderObject<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectSeal for BinderObjectRef<T> {}
+impl<T: TransactionHandler> OwnedBinderObjectRef for BinderObjectRef<T> {}
 impl ToBinderObjectOrRef for WeakBinderObject {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
         BinderObjectOrRef::WeakObject(WeakBinderObject {
