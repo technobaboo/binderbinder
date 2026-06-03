@@ -34,9 +34,6 @@ use tracing::{debug, error, info, trace, warn};
 
 pub struct Transaction {
     pub code: u32,
-    /// you need to drop the transaction payload for oneway transactions to be counted as "handled",
-    /// please whatever you do, if you're in a oneway transaction handler copy the data out as soon as absolutly possible and drop the
-    /// payload, else this will cause deadlocks and freeze, please, trust me
     pub payload: PayloadReader,
     pub sender_pid: RawPid,
     pub sender_euid: RawUid,
@@ -188,7 +185,7 @@ impl BinderDevice {
                                 sleep(Duration::from_millis(1));
                             }
                             drop(started);
-                            looper(&runtime, dev, fd);
+                            looper(&runtime, dev, fd, false);
                         }
                     })
                 })
@@ -567,10 +564,14 @@ unsafe fn write_binder_command<Fd: AsFd>(
     io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd.as_ref(), &mut binder_wr) })
 }
 
-fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>) {
+fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>, spawned: bool) {
+    let cmd = if spawned {
+        BinderCommand::REGISTER_LOOPER
+    } else {
+        BinderCommand::ENTER_LOOPER
+    };
     let mut init_data = Vec::new();
-    // init_data.extend_from_slice(&BinderCommand::REGISTER_LOOPER.as_u32().to_ne_bytes());
-    init_data.extend_from_slice(&BinderCommand::ENTER_LOOPER.as_u32().to_ne_bytes());
+    init_data.extend_from_slice(&cmd.as_u32().to_ne_bytes());
     let mut init_data = Some(init_data.as_slice());
     loop {
         match unsafe { binder_write_read(&dev_fd, init_data.take(), &device, runtime) } {
@@ -678,7 +679,7 @@ unsafe fn binder_write_read(
                     )
                 };
                 if transaction.flags.contains(TransactionFlags::ONE_WAY) {
-                    runtime.spawn(handler.handle_one_way(Transaction {
+                    runtime.block_on(handler.handle_one_way(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
                         sender_pid: transaction.sender_pid,
@@ -795,7 +796,7 @@ unsafe fn binder_write_read(
                 let device = Arc::downgrade(&device);
                 let dev_fd = dev_fd.clone();
                 let runtime = runtime.clone();
-                std::thread::spawn(move || looper(&runtime, device, dev_fd));
+                std::thread::spawn(move || looper(&runtime, device, dev_fd, true));
             }
             BinderReturn::FINISHED => {
                 debug!("finished?");
