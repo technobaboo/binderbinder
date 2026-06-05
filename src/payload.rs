@@ -162,7 +162,7 @@ impl<'a> PayloadBuilder<'a> {
         self.align(align_of::<BinderFdArrayObject>());
         let fd_obj = BinderFdArrayObject {
             hdr: BinderObjectHeader {
-                type_: BinderType::PTR,
+                type_: BinderType::FDA,
             },
             _pad: 0,
             num_fds,
