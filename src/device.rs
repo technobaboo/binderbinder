@@ -584,7 +584,9 @@ fn looper(
     let mut init_data = Some(init_data.as_slice());
     loop {
         match unsafe { binder_write_read(&dev_fd, init_data.take(), &device, runtime) } {
-            Some(Ok(_)) => todo!(),
+            Some(Ok(_)) => {
+                error!("looper unexpectedly received a reply, ignoring");
+            }
             Some(Err(WriteReadError::NoDevice)) => {
                 break;
             }
