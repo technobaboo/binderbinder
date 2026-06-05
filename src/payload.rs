@@ -231,7 +231,7 @@ impl PayloadReader {
         if !offsets.is_none_or(|v| {
             v.iter()
                 .find(|v| **v > self.next_data_index)
-                .is_none_or(|v| self.next_data_index + num_bytes < *v)
+                .is_none_or(|v| self.next_data_index + num_bytes <= *v)
         }) {
             return Err(PayloadBytesReadError::ReadingIntoObject);
         }
