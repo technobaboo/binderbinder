@@ -1,57 +1,49 @@
-use std::fmt;
 use std::io;
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    Io(io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("OS error: {0}")]
     Os(i32),
-    Binder(rustix::io::Errno),
+    #[error("binder operation failed: {0}")]
+    Binder(#[from] rustix::io::Errno),
+    #[error("invalid handle: {0}")]
     InvalidHandle(u32),
+    #[error("handle not found: {0}")]
     HandleNotFound(u32),
+    #[error("invalid transaction data")]
     InvalidTransaction,
+    #[error("transaction failed: {0}")]
     Transaction(String),
+    #[error("object not found")]
     ObjectNotFound,
+    #[error("invalid object type")]
     InvalidObjectType,
+    #[error("not connected to binder driver")]
     NotConnected,
+    #[error("already connected")]
     AlreadyConnected,
+    #[error("permission denied")]
     PermissionDenied,
+    #[error("out of memory")]
     OutOfMemory,
+    #[error("invalid argument")]
     InvalidArgument,
+    #[error("actor shutdown")]
     Shutdown,
+    #[error("channel full")]
     ChannelFull,
+    #[error("dead binder")]
     DeadBinder,
+    #[error("dead reply")]
     DeadReply,
+    #[error("already exists")]
     AlreadyExists,
+    #[error("unknown error: {0}")]
     Unknown(i32),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(e) => write!(f, "IO error: {}", e),
-            Error::Os(e) => write!(f, "OS error: {}", e),
-            Error::Binder(e) => write!(f, "binder operation failed: {}", e),
-            Error::InvalidHandle(h) => write!(f, "invalid handle: {}", h),
-            Error::HandleNotFound(h) => write!(f, "handle not found: {}", h),
-            Error::InvalidTransaction => write!(f, "invalid transaction data"),
-            Error::Transaction(msg) => write!(f, "transaction failed: {}", msg),
-            Error::ObjectNotFound => write!(f, "object not found"),
-            Error::InvalidObjectType => write!(f, "invalid object type"),
-            Error::NotConnected => write!(f, "not connected to binder driver"),
-            Error::AlreadyConnected => write!(f, "already connected"),
-            Error::PermissionDenied => write!(f, "permission denied"),
-            Error::OutOfMemory => write!(f, "out of memory"),
-            Error::InvalidArgument => write!(f, "invalid argument"),
-            Error::Shutdown => write!(f, "actor shutdown"),
-            Error::ChannelFull => write!(f, "channel full"),
-            Error::DeadBinder => write!(f, "dead binder"),
-            Error::DeadReply => write!(f, "dead reply"),
-            Error::AlreadyExists => write!(f, "already exists"),
-            Error::Unknown(e) => write!(f, "unknown error: {}", e),
-        }
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
