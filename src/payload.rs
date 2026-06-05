@@ -448,9 +448,6 @@ impl Drop for PayloadReader {
     fn drop(&mut self) {
         unsafe {
             self.data.free(&self.device);
-            if let Some(v) = self.offsets.as_mut() {
-                v.free(&self.device)
-            }
         }
     }
 }
