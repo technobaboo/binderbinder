@@ -36,10 +36,21 @@ pub enum Error {
     Shutdown,
     #[error("channel full")]
     ChannelFull,
+    /// The remote binder object no longer exists. Its owning process has died
+    /// or the object was explicitly destroyed. Any handles to it are now invalid.
     #[error("dead binder")]
     DeadBinder,
+    /// The target of a transaction died before it could send a reply.
+    /// The transaction was delivered but the process crashed or exited before
+    /// completing it, so no reply will ever arrive.
     #[error("dead reply")]
     DeadReply,
+    /// The target process is frozen and cannot receive synchronous transactions.
+    /// This is returned when the kernel rejects a transaction because the target
+    /// has been suspended via the freeze mechanism (e.g. app standby).
+    /// One-way transactions may still be queued depending on kernel policy.
+    #[error("frozen reply")]
+    FrozenReply,
     #[error("already exists")]
     AlreadyExists,
     #[error("unknown error: {0}")]

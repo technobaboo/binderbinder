@@ -386,6 +386,9 @@ impl BinderDevice {
                     error!("remote twoway {}", WriteReadError::FailedReply);
                     break Err(Error::Unknown(1));
                 }
+                Some(Err(WriteReadError::FrozenReply)) => {
+                    break Err(Error::FrozenReply);
+                }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                     break Err(Error::Binder(err));
                 }
@@ -451,6 +454,7 @@ impl BinderDevice {
         Err(match v {
             Some(Err(WriteReadError::NoDevice)) => Error::Shutdown,
             Some(Err(WriteReadError::DeadReply)) => Error::DeadReply,
+            Some(Err(WriteReadError::FrozenReply)) => Error::FrozenReply,
             Some(Err(WriteReadError::ObjectNotFound)) => Error::ObjectNotFound,
             Some(Err(WriteReadError::FailedReply)) => {
                 error!("remote transact oneway {}", WriteReadError::FailedReply);
@@ -564,7 +568,12 @@ unsafe fn write_binder_command<Fd: AsFd>(
     io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd.as_ref(), &mut binder_wr) })
 }
 
-fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: Arc<OwnedFd>, spawned: bool) {
+fn looper(
+    runtime: &tokio::runtime::Handle,
+    device: Weak<BinderDevice>,
+    dev_fd: Arc<OwnedFd>,
+    spawned: bool,
+) {
     let cmd = if spawned {
         BinderCommand::REGISTER_LOOPER
     } else {
@@ -583,6 +592,9 @@ fn looper(runtime: &tokio::runtime::Handle, device: Weak<BinderDevice>, dev_fd: 
             Some(Err(WriteReadError::ObjectNotFound)) => {}
             Some(Err(WriteReadError::FailedReply)) => {
                 error!("looper {}", WriteReadError::FailedReply);
+            }
+            Some(Err(WriteReadError::FrozenReply)) => {
+                debug!("looper: transaction target was frozen");
             }
             Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                 error!("WriteRead failed: {err}");
@@ -824,7 +836,7 @@ unsafe fn binder_write_read(
                 return Some(Err(WriteReadError::FailedReply));
             }
             BinderReturn::FROZEN_REPLY => {
-                debug!("frozen reply");
+                return Some(Err(WriteReadError::FrozenReply));
             }
             BinderReturn::ONEWAY_SPAM_SUSPECT => {
                 debug!("oneway spam suspect");
@@ -859,6 +871,8 @@ enum WriteReadError {
     DeadReply,
     #[error("Reply Failed")]
     FailedReply,
+    #[error("Frozen Reply")]
+    FrozenReply,
     #[error("No device")]
     NoDevice,
     #[error("WriteRead failed: {0}")]
