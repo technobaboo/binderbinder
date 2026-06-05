@@ -160,7 +160,7 @@ impl BinderDevice {
     pub fn new(path: impl AsRef<Path>) -> rustix::io::Result<Arc<Self>> {
         let fd = rustix::fs::open(
             path.as_ref(),
-            OFlags::CLOEXEC | OFlags::RDONLY,
+            OFlags::CLOEXEC | OFlags::RDWR,
             Mode::empty(),
         )?;
         Ok(Self::from_fd(fd))
