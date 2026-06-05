@@ -389,6 +389,9 @@ impl BinderDevice {
                 Some(Err(WriteReadError::FrozenReply)) => {
                     break Err(Error::FrozenReply);
                 }
+                Some(Err(WriteReadError::AsyncBufferFull)) => {
+                    sleep(Duration::from_millis(1));
+                }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                     break Err(Error::Binder(err));
                 }
@@ -446,23 +449,28 @@ impl BinderDevice {
             slice::from_raw_parts(&raw const transaction as _, size_of_val(&transaction))
         });
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
-        let mut write_data = Some(bytes.as_slice());
-        let v = unsafe {
-            binder_write_read(&self.fd, write_data.take(), &Arc::downgrade(self), runtime)
-        };
-
-        Err(match v {
-            Some(Err(WriteReadError::NoDevice)) => Error::Shutdown,
-            Some(Err(WriteReadError::DeadReply)) => Error::DeadReply,
-            Some(Err(WriteReadError::FrozenReply)) => Error::FrozenReply,
-            Some(Err(WriteReadError::ObjectNotFound)) => Error::ObjectNotFound,
-            Some(Err(WriteReadError::FailedReply)) => {
-                error!("remote transact oneway {}", WriteReadError::FailedReply);
-                Error::Unknown(1)
+        let weak = Arc::downgrade(self);
+        loop {
+            let v = unsafe {
+                binder_write_read(&self.fd, Some(bytes.as_slice()), &weak, runtime)
+            };
+            match v {
+                Some(Err(WriteReadError::AsyncBufferFull)) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Some(Err(WriteReadError::NoDevice)) => return Err(Error::Shutdown),
+                Some(Err(WriteReadError::DeadReply)) => return Err(Error::DeadReply),
+                Some(Err(WriteReadError::FrozenReply)) => return Err(Error::FrozenReply),
+                Some(Err(WriteReadError::ObjectNotFound)) => return Err(Error::ObjectNotFound),
+                Some(Err(WriteReadError::FailedReply)) => {
+                    error!("remote transact oneway {}", WriteReadError::FailedReply);
+                    return Err(Error::Unknown(1));
+                }
+                Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => return Err(Error::Binder(err)),
+                _ => return Ok(()),
             }
-            Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => Error::Binder(err),
-            _ => return Ok(()),
-        })
+        }
     }
 }
 #[derive(Debug)]
@@ -597,6 +605,9 @@ fn looper(
             }
             Some(Err(WriteReadError::FrozenReply)) => {
                 debug!("looper: transaction target was frozen");
+            }
+            Some(Err(WriteReadError::AsyncBufferFull)) => {
+                debug!("looper: async buffer full");
             }
             Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                 error!("WriteRead failed: {err}");
@@ -834,7 +845,11 @@ unsafe fn binder_write_read(
                 debug!("clear death notif");
             }
             BinderReturn::FAILED_REPLY => {
-                warn!("failed reply: {:?}", unsafe { device.get_last_error() });
+                let extended = unsafe { device.get_last_error() };
+                if extended.param == -(rustix::io::Errno::NOSPC.raw_os_error() as i32) {
+                    return Some(Err(WriteReadError::AsyncBufferFull));
+                }
+                warn!("failed reply: {:?}", extended);
                 return Some(Err(WriteReadError::FailedReply));
             }
             BinderReturn::FROZEN_REPLY => {
@@ -875,6 +890,8 @@ enum WriteReadError {
     FailedReply,
     #[error("Frozen Reply")]
     FrozenReply,
+    #[error("Async buffer full (ENOSPC)")]
+    AsyncBufferFull,
     #[error("No device")]
     NoDevice,
     #[error("WriteRead failed: {0}")]
