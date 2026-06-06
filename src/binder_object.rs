@@ -419,14 +419,17 @@ impl<H: TransactionHandler> BinderObject<H> {
         let obj_ref =
             BinderObjectRef::from_id(device.clone(), id).expect("holding all required refs");
 
+        // Subscribe before spawning so notify_waiters() fired before the task's first poll
+        // is not lost. Notified registers the listener at construction, not at .await.
+        let hit_zero_notified = device
+            .object_refcounts
+            .get(&id)
+            .map(|v| v.strong_count_hit_zero.clone().notified_owned());
+
         // Spawn a task to clean up when strong refs hit zero
         tokio::spawn(async move {
-            let hit_zero_arc = device
-                .object_refcounts
-                .get(&id)
-                .map(|v| v.strong_count_hit_zero.clone());
-            if let Some(notify) = hit_zero_arc {
-                notify.notified().await;
+            if let Some(notified) = hit_zero_notified {
+                notified.await;
             }
             // Remove from retained_services, which drops the guard, which removes from objects
             device.retained_services.remove(&id);
