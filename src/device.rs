@@ -421,6 +421,11 @@ impl BinderDevice {
         });
         Ok(())
     }
+    #[instrument(
+        name = "Remote oneway transaction",
+        level = "trace",
+        skip(self, data, runtime)
+    )]
     fn remote_transact_one_way(
         self: &Arc<Self>,
         handle: u32,
