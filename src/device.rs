@@ -701,13 +701,9 @@ unsafe fn binder_write_read(
                     unsafe { transaction.target.binder },
                     transaction.cookie,
                 );
-                let handler = {
-                    let Some(entry) = device.objects.get(&target) else {
-                        warn!("unable to find handler for: {target:?}");
-                        return Some(Err(WriteReadError::ObjectNotFound));
-                    };
-                    entry.clone()
-                };
+                // Create payload_reader before the handler lookup so its Drop always sends
+                // FREE_BUFFER to the kernel, even if we bail out early. Without this, a
+                // missing handler silently leaks the transaction buffer until it fills up.
                 let payload_reader = unsafe {
                     PayloadReader::from_kernel_raw(
                         device.clone(),
@@ -716,6 +712,41 @@ unsafe fn binder_write_read(
                         transaction.data.offsets as *const usize,
                         transaction.offsets_size / size_of::<usize>(),
                     )
+                };
+                let handler = {
+                    let Some(entry) = device.objects.get(&target) else {
+                        warn!("unable to find handler for: {target:?}");
+                        // Drop payload_reader first to send FREE_BUFFER before any reply.
+                        drop(payload_reader);
+                        if !transaction.flags.contains(TransactionFlags::ONE_WAY) {
+                            // Send an empty reply so the remote caller isn't blocked forever.
+                            let empty_reply = BinderTransactionData {
+                                target: sys::TransactionTarget { binder: 0 },
+                                cookie: 0,
+                                code: transaction.code,
+                                flags: transaction.flags,
+                                sender_pid: rustix::process::getpid().as_raw_pid(),
+                                sender_euid: rustix::process::getuid().as_raw(),
+                                data_size: 0,
+                                offsets_size: 0,
+                                data: crate::sys::BinderTransactionDataPtrs {
+                                    buffer: 0,
+                                    offsets: 0,
+                                },
+                            };
+                            let mut bytes = Vec::new();
+                            bytes.extend_from_slice(&BinderCommand::REPLY.as_u32().to_ne_bytes());
+                            bytes.extend_from_slice(unsafe {
+                                slice::from_raw_parts(
+                                    &raw const empty_reply as _,
+                                    size_of_val(&empty_reply),
+                                )
+                            });
+                            write_binder_command(dev_fd, &bytes).unwrap();
+                        }
+                        return Some(Err(WriteReadError::ObjectNotFound));
+                    };
+                    entry.clone()
                 };
                 if transaction.flags.contains(TransactionFlags::ONE_WAY) {
                     let _guard = trace_span!("Handle oneway transaction").entered();

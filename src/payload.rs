@@ -179,7 +179,7 @@ impl<'a> PayloadBuilder<'a> {
         self.data.extend_from_slice(slice);
     }
     pub fn align(&mut self, align: usize) {
-        while self.data.len() % align != 0 {
+        while !self.data.len().is_multiple_of(align) {
             self.data.push(0);
         }
     }
