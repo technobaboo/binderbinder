@@ -30,7 +30,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, trace_span, warn};
+use tracing::{debug, error, info, instrument, trace, trace_span, warn};
 
 pub struct Transaction {
     pub code: u32,
@@ -168,22 +168,25 @@ impl BinderDevice {
         let started = Arc::new(AtomicBool::new(false));
         let dev = Arc::new_cyclic(|weak| {
             let loopers = (0..5)
-                .map(|_| {
-                    std::thread::spawn({
-                        let runtime = tokio::runtime::Handle::current();
-                        let fd = fd.clone();
-                        let dev = weak.clone();
-                        let started = started.clone();
-                        move || {
-                            let _guard = runtime.enter();
-                            // we love busy waiting
-                            while !started.load(Ordering::Relaxed) {
-                                sleep(Duration::from_millis(1));
+                .filter_map(|i| {
+                    std::thread::Builder::new()
+                        .name(format!("Binder looper {i}"))
+                        .spawn({
+                            let runtime = tokio::runtime::Handle::current();
+                            let fd = fd.clone();
+                            let dev = weak.clone();
+                            let started = started.clone();
+                            move || {
+                                let _guard = runtime.enter();
+                                // we love busy waiting
+                                while !started.load(Ordering::Relaxed) {
+                                    sleep(Duration::from_millis(1));
+                                }
+                                drop(started);
+                                looper(&runtime, dev, fd, false);
                             }
-                            drop(started);
-                            looper(&runtime, dev, fd, false);
-                        }
-                    })
+                        })
+                        .ok()
                 })
                 .collect();
             Self {
@@ -575,6 +578,7 @@ unsafe fn write_binder_command<Fd: AsFd>(
     io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(fd.as_ref(), &mut binder_wr) })
 }
 
+#[instrument(level = "trace", skip(runtime, device))]
 fn looper(
     runtime: &tokio::runtime::Handle,
     device: Weak<BinderDevice>,
@@ -620,6 +624,7 @@ fn looper(
     }
     // TODO: figure out how the binder thread(not looper) exit call works
 }
+#[instrument(level = "trace", skip(write_data, device, runtime))]
 unsafe fn binder_write_read(
     dev_fd: &Arc<OwnedFd>,
     write_data: Option<&[u8]>,
@@ -822,7 +827,9 @@ unsafe fn binder_write_read(
                 let device = Arc::downgrade(&device);
                 let dev_fd = dev_fd.clone();
                 let runtime = runtime.clone();
-                std::thread::spawn(move || looper(&runtime, device, dev_fd, true));
+                let _ = std::thread::Builder::new()
+                    .name("Binder looper (requested)".into())
+                    .spawn(move || looper(&runtime, device, dev_fd, true));
             }
             BinderReturn::FINISHED => {
                 debug!("finished?");
