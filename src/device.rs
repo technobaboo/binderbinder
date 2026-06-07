@@ -646,7 +646,12 @@ unsafe fn binder_write_read(
     //     info!(?binder_wr);
     // }
     // info!(v = write_data.is_some());
-    let res = io::retry_on_intr(|| unsafe { rustix::ioctl::ioctl(dev_fd, &mut binder_wr) });
+    let _guard = trace_span!("ioctl wait").entered();
+    let res = io::retry_on_intr(|| {
+        let _trace = trace_span!("ioctl try").entered();
+        unsafe { rustix::ioctl::ioctl(dev_fd, &mut binder_wr) }
+    });
+    drop(_guard);
     if let Err(err) = res {
         error!("binder write_read call failed: {err}");
         return Some(Err(WriteReadError::WriteReadIoctlFailed(err)));
