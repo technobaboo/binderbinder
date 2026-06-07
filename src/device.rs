@@ -16,7 +16,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use rustix::process::{self, RawPid, RawUid};
-use std::any::{type_name, type_name_of_val, Any};
+use std::any::{type_name_of_val, Any};
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::future::Future;
@@ -324,7 +324,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
-        let guard = trace_span!("Local blocking transaction").entered();
+        let _guard = trace_span!("Local blocking transaction").entered();
         let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction {
@@ -895,7 +895,7 @@ unsafe fn binder_write_read(
             }
             BinderReturn::FAILED_REPLY => {
                 let extended = unsafe { device.get_last_error() };
-                if extended.param == -(rustix::io::Errno::NOSPC.raw_os_error() as i32) {
+                if extended.param == -rustix::io::Errno::NOSPC.raw_os_error() {
                     return Some(Err(WriteReadError::AsyncBufferFull));
                 }
                 warn!("failed reply: {:?}", extended);
@@ -997,7 +997,7 @@ impl<T: TransactionHandler> ErasedTransactionHandler for T {
 mod tests {
     use super::*;
     use crate::payload::PayloadBuilder;
-    use std::{any::type_name, sync::Arc};
+    use std::sync::Arc;
 
     const BINDER_PATH: &str = "/dev/binderfs/testbinder";
 
