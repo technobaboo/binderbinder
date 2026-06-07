@@ -30,7 +30,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, trace_span, warn};
 
 pub struct Transaction {
     pub code: u32,
@@ -321,6 +321,7 @@ impl BinderDevice {
         data: PayloadBuilder<'_>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(u32, PayloadReader)> {
+        let guard = trace_span!("Local blocking transaction").entered();
         let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         let reply = runtime.block_on(handler.handle(Transaction {
@@ -404,6 +405,8 @@ impl BinderDevice {
         let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         tokio::spawn(async move {
+            let _trace = trace_span!("Local oneway transaction");
+            let _guard = _trace.enter();
             handler
                 .handle_one_way(Transaction {
                     code,
@@ -700,6 +703,7 @@ unsafe fn binder_write_read(
                     )
                 };
                 if transaction.flags.contains(TransactionFlags::ONE_WAY) {
+                    let _guard = trace_span!("Handle oneway transaction").entered();
                     runtime.block_on(handler.handle_one_way(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
@@ -707,6 +711,7 @@ unsafe fn binder_write_read(
                         sender_euid: transaction.sender_euid,
                     }));
                 } else {
+                    let _guard = trace_span!("Handle transaction").entered();
                     let reply_data = runtime.block_on(handler.handle(Transaction {
                         code: transaction.code,
                         payload: payload_reader,
