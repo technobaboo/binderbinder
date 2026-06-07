@@ -828,7 +828,7 @@ unsafe fn binder_write_read(
                 let dev_fd = dev_fd.clone();
                 let runtime = runtime.clone();
                 let _ = std::thread::Builder::new()
-                    .name("Binder looper (requested)".into())
+                    .name("Requested binder looper".into())
                     .spawn(move || looper(&runtime, device, dev_fd, true));
             }
             BinderReturn::FINISHED => {
