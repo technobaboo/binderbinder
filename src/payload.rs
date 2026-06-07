@@ -219,6 +219,11 @@ pub struct PayloadReader {
     device: Arc<BinderDevice>,
     data: PayloadReaderBuffer<u8>,
     offsets: Option<PayloadReaderBuffer<usize>>,
+    // Keeps binder objects alive for the lifetime of this reader. Without this,
+    // objects registered in a PayloadBuilder can be dropped before from_builder's
+    // caller reads them — their refcount hits zero, the cleanup task unregisters
+    // them, and read_binder_ref returns UnregisteredBinderObject.
+    _binder_objects: Vec<BinderObjectOrRef>,
 
     next_offset_index: usize,
     next_data_index: usize,
@@ -374,6 +379,7 @@ impl PayloadReader {
             offsets: offsets_ptr.is_null().not().then(|| {
                 PayloadReaderBuffer::KernelBorrowed(slice::from_raw_parts(offsets_ptr, offsets_len))
             }),
+            _binder_objects: Vec::new(),
             next_offset_index: 0,
             next_data_index: 0,
         }
@@ -426,6 +432,7 @@ impl PayloadReader {
             device,
             data: PayloadReaderBuffer::Owned(main_data),
             offsets: Some(PayloadReaderBuffer::Owned(offsets)),
+            _binder_objects: builder.binder_objects.clone(),
             next_offset_index: 0,
             next_data_index: 0,
         }
