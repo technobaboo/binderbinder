@@ -16,7 +16,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use rustix::process::{self, RawPid, RawUid};
-use std::any::Any;
+use std::any::{type_name, type_name_of_val, Any};
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::future::Future;
@@ -158,11 +158,7 @@ impl BinderDevice {
         error
     }
     pub fn new(path: impl AsRef<Path>) -> rustix::io::Result<Arc<Self>> {
-        let fd = rustix::fs::open(
-            path.as_ref(),
-            OFlags::CLOEXEC | OFlags::RDWR,
-            Mode::empty(),
-        )?;
+        let fd = rustix::fs::open(path.as_ref(), OFlags::CLOEXEC | OFlags::RDWR, Mode::empty())?;
         Ok(Self::from_fd(fd))
     }
     /// Create a new BinderDevice from an already-open fd.
@@ -451,9 +447,7 @@ impl BinderDevice {
         bytes.extend_from_slice(&BinderCommand::EXIT_LOOPER.as_u32().to_ne_bytes());
         let weak = Arc::downgrade(self);
         loop {
-            let v = unsafe {
-                binder_write_read(&self.fd, Some(bytes.as_slice()), &weak, runtime)
-            };
+            let v = unsafe { binder_write_read(&self.fd, Some(bytes.as_slice()), &weak, runtime) };
             match v {
                 Some(Err(WriteReadError::AsyncBufferFull)) => {
                     std::thread::yield_now();
@@ -467,7 +461,9 @@ impl BinderDevice {
                     error!("remote transact oneway {}", WriteReadError::FailedReply);
                     return Err(Error::Unknown(1));
                 }
-                Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => return Err(Error::Binder(err)),
+                Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
+                    return Err(Error::Binder(err))
+                }
                 _ => return Ok(()),
             }
         }
@@ -904,6 +900,9 @@ unsafe fn read_from_slice<T>(slice: &[u8], consumed: &mut usize) -> T {
 }
 
 pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
+    fn type_name(&self) -> &'static str {
+        type_name_of_val(self)
+    }
     fn handle(
         self: Arc<Self>,
         transaction: Transaction,
@@ -938,5 +937,158 @@ impl<T: TransactionHandler> ErasedTransactionHandler for T {
         transaction: Transaction,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(TransactionHandler::handle_one_way(self, transaction))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::payload::PayloadBuilder;
+    use std::{any::type_name, sync::Arc};
+
+    const BINDER_PATH: &str = "/dev/binderfs/testbinder";
+
+    #[derive(Debug)]
+    struct NoopService;
+
+    impl TransactionHandler for NoopService {
+        async fn handle(self: Arc<Self>, _tx: Transaction) -> PayloadBuilder<'static> {
+            PayloadBuilder::new()
+        }
+        async fn handle_one_way(self: Arc<Self>, _tx: Transaction) {}
+    }
+
+    fn open_device() -> Arc<BinderDevice> {
+        BinderDevice::new(BINDER_PATH)
+            .expect("open testbinder — run the new_device example as root first")
+    }
+
+    /// A plain BinderObject cleans up both maps on drop.
+    #[tokio::test]
+    async fn binder_object_drops_cleanly() {
+        let dev = open_device();
+        let obj: crate::binder_object::BinderObject<NoopService> =
+            dev.register_object(Arc::new(NoopService));
+        let id = obj.id;
+
+        assert!(dev.objects.contains_key(&id));
+        assert!(dev.object_refcounts.contains_key(&id));
+
+        drop(obj);
+
+        assert!(
+            !dev.objects.contains_key(&id),
+            "object still in objects after drop"
+        );
+        assert!(
+            !dev.object_refcounts.contains_key(&id),
+            "refcounts still present after drop"
+        );
+    }
+
+    /// to_service() keeps the guard alive until the last BinderObjectRef is dropped,
+    /// then the cleanup task removes it from retained_services and objects.
+    #[tokio::test]
+    async fn service_drops_when_last_ref_gone() {
+        let dev = open_device();
+        let handler = Arc::new(NoopService);
+        let weak_handler = Arc::downgrade(&handler);
+
+        let obj: crate::binder_object::BinderObject<NoopService> = dev.register_object(handler);
+        let id = obj.id;
+
+        let service_ref = obj.to_service();
+
+        assert!(
+            dev.retained_services.contains_key(&id),
+            "service not retained after to_service"
+        );
+        assert!(dev.objects.contains_key(&id));
+        assert!(
+            weak_handler.upgrade().is_some(),
+            "handler dropped too early"
+        );
+
+        drop(service_ref);
+
+        // Yield a few times so the spawned cleanup task runs.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !dev.retained_services.contains_key(&id),
+            "retained_services not cleaned up after last ref dropped"
+        );
+        assert!(!dev.objects.contains_key(&id), "objects not cleaned up");
+        assert!(
+            weak_handler.upgrade().is_none(),
+            "handler Arc not fully dropped"
+        );
+    }
+
+    /// strong_refs_hit_zero() resolves as soon as the last local ref is dropped.
+    #[tokio::test]
+    async fn strong_refs_hit_zero_fires_on_last_drop() {
+        let dev = open_device();
+        let obj: crate::binder_object::BinderObject<NoopService> =
+            dev.register_object(Arc::new(NoopService));
+
+        let service_ref = obj.to_service();
+        let hit_zero = service_ref.strong_refs_hit_zero();
+
+        // Drop on a separate task so hit_zero is polled (registering its waiter) first.
+        // notify_waiters() only wakes already-registered waiters; if we dropped inline the
+        // notification could fire before notified() is ever called inside the future.
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(service_ref);
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), hit_zero)
+            .await
+            .expect("strong_refs_hit_zero did not fire within 500 ms");
+    }
+
+    /// Cloning a BinderObjectRef delays cleanup until every clone is dropped.
+    #[tokio::test]
+    async fn service_survives_until_all_clones_dropped() {
+        let dev = open_device();
+        let handler = Arc::new(NoopService);
+        let weak_handler = Arc::downgrade(&handler);
+
+        let obj: crate::binder_object::BinderObject<NoopService> = dev.register_object(handler);
+        let id = obj.id;
+
+        let ref_a = obj.to_service();
+        let ref_b = ref_a.clone();
+
+        // Drop first clone — service must still be alive.
+        drop(ref_a);
+        tokio::task::yield_now().await;
+
+        assert!(
+            dev.retained_services.contains_key(&id),
+            "service cleaned up while a clone still exists"
+        );
+        assert!(
+            weak_handler.upgrade().is_some(),
+            "handler dropped while ref_b is alive"
+        );
+
+        // Drop the last clone — service may now be cleaned up.
+        drop(ref_b);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !dev.retained_services.contains_key(&id),
+            "retained_services not cleaned up after all clones dropped"
+        );
+        assert!(
+            weak_handler.upgrade().is_none(),
+            "handler Arc not fully dropped"
+        );
     }
 }

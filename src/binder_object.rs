@@ -495,7 +495,7 @@ impl<H: TransactionHandler> Eq for BinderObject<H> {}
 
 impl<H: TransactionHandler> Drop for BinderObject<H> {
     fn drop(&mut self) {
-        tracing::trace!(?self.id, "Dropping BinderObject");
+        tracing::trace!(?self.id, type_name = self.handler.type_name(), "Dropping BinderObject");
         self.device.remove_binder_object(&self.id);
     }
 }
