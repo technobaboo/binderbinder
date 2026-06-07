@@ -453,6 +453,25 @@ impl<T: Sized + 'static> PayloadReaderBuffer<T> {
 }
 impl Drop for PayloadReader {
     fn drop(&mut self) {
+        while let Some(obj_type) = self.next_object_type() {
+            match obj_type {
+                BinderObjectType::BinderObject
+                | BinderObjectType::WeakBinderObject
+                | BinderObjectType::BinderRef
+                | BinderObjectType::WeakBinderRef => {
+                    _ = self.read_binder_ref();
+                }
+                BinderObjectType::Fd => {
+                    _ = self.read_fd();
+                }
+                BinderObjectType::FdArray => {
+                    tracing::warn!("tried to drain fd array from PayloadReader, unimplemented")
+                }
+                BinderObjectType::Buffer => {
+                    tracing::warn!("tried to drain buffer from PayloadReader, unimplemented")
+                }
+            }
+        }
         unsafe {
             self.data.free(&self.device);
         }
