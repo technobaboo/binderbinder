@@ -137,6 +137,7 @@ impl TransactionTargetImpl for BinderRef {
 }
 impl Drop for BinderRef {
     fn drop(&mut self) {
+        tracing::trace!(id = self.weak.id, "Dropping binder ref");
         unsafe {
             self.device
                 .write_binder_struct_command(BinderCommand::RELEASE, &self.handle());
