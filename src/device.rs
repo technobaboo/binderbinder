@@ -159,15 +159,15 @@ impl BinderDevice {
     }
     pub fn new(path: impl AsRef<Path>) -> rustix::io::Result<Arc<Self>> {
         let fd = rustix::fs::open(path.as_ref(), OFlags::CLOEXEC | OFlags::RDWR, Mode::empty())?;
-        Ok(Self::from_fd(fd))
+        Ok(Self::from_fd(fd, 5))
     }
     /// Create a new BinderDevice from an already-open fd.
-    pub fn from_fd(fd: impl Into<OwnedFd>) -> Arc<Self> {
+    pub fn from_fd(fd: impl Into<OwnedFd>, looper_count: usize) -> Arc<Self> {
         let fd = Arc::new(fd.into());
         let backing = BinderBackingMemMap::new(fd.as_fd(), 1024 * 1024);
         let started = Arc::new(AtomicBool::new(false));
         let dev = Arc::new_cyclic(|weak| {
-            let loopers = (0..5)
+            let loopers = (0..looper_count)
                 .filter_map(|i| {
                     std::thread::Builder::new()
                         .name(format!("Binder looper {i}"))
