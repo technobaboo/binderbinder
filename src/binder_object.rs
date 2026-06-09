@@ -335,6 +335,12 @@ impl BorrowedBinderObject {
             handler,
         })
     }
+    pub fn downgrade(&self) -> WeakBinderObject {
+        WeakBinderObject {
+            device: self.device.clone(),
+            id: self.id,
+        }
+    }
     pub fn id(&self) -> &BinderObjectId {
         &self.id
     }
@@ -436,6 +442,12 @@ impl<H: TransactionHandler> BinderObject<H> {
             device.retained_services.remove(&id);
         });
         obj_ref
+    }
+    pub fn downgrade(&self) -> WeakBinderObject {
+        WeakBinderObject {
+            device: self.device.clone(),
+            id: self.id,
+        }
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
@@ -666,6 +678,12 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
             id,
             handler,
         })
+    }
+    pub fn downgrade(&self) -> WeakBinderObject {
+        WeakBinderObject {
+            device: self.device.clone(),
+            id: self.id,
+        }
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
