@@ -30,7 +30,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, instrument, trace, trace_span, warn};
+use tracing::{debug, error, info, instrument, trace, trace_span, warn, Instrument};
 
 pub struct Transaction {
     pub code: u32,
@@ -408,8 +408,6 @@ impl BinderDevice {
         let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
         tokio::spawn(async move {
-            let _trace = trace_span!("Local oneway transaction");
-            let _guard = _trace.enter();
             handler
                 .handle_one_way(Transaction {
                     code,
@@ -417,6 +415,7 @@ impl BinderDevice {
                     sender_pid: process::getpid().as_raw_pid(),
                     sender_euid: process::geteuid().as_raw(),
                 })
+                .instrument(trace_span!("Local oneway transaction"))
                 .await
         });
         Ok(())
