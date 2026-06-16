@@ -177,7 +177,6 @@ impl BinderDevice {
                             let dev = weak.clone();
                             let started = started.clone();
                             move || {
-                                let _guard = runtime.enter();
                                 // we love busy waiting
                                 while !started.load(Ordering::Relaxed) {
                                     sleep(Duration::from_millis(1));
@@ -589,6 +588,7 @@ fn looper(
     dev_fd: Arc<OwnedFd>,
     spawned: bool,
 ) {
+    let _guard = runtime.enter();
     let cmd = if spawned {
         BinderCommand::REGISTER_LOOPER
     } else {
