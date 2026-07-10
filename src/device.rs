@@ -98,6 +98,27 @@ impl ObjectRefState {
             self.strong_count_hit_zero.notify_waiters();
         }
     }
+    /// About to hand this object to a remote process in a transaction: guards against
+    /// `decrease_local` firing `strong_count_hit_zero` prematurely between the sender's
+    /// transient local ref dropping and the matching BR_ACQUIRE coming back.
+    pub(crate) fn mark_pending_remote(&self) {
+        if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
+            self.new_in_remote.store(true, Ordering::Relaxed);
+        }
+    }
+    /// Roll back a `mark_pending_remote` whose transaction never completed (write failed,
+    /// dead reply, peer died mid-flight, ...), so the BR_ACQUIRE that would normally clear
+    /// it is never going to arrive. Without this, `new_in_remote` stays stuck `true` forever
+    /// and `decrease_local` can never fire `strong_count_hit_zero` again.
+    pub(crate) fn clear_pending_remote(&self) {
+        if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
+            self.new_in_remote.store(false, Ordering::Relaxed);
+            if self.local_strong_count.load(Ordering::Relaxed) == 0 {
+                tracing::debug!(?self.obj_id, "sending strong hit zero after failed remote send");
+                self.strong_count_hit_zero.notify_waiters();
+            }
+        }
+    }
 }
 
 /// Shared binder device state.
@@ -373,25 +394,31 @@ impl BinderDevice {
             match v {
                 Some(Ok(v)) => break Ok(v),
                 Some(Err(WriteReadError::NoDevice)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::Shutdown);
                 }
                 Some(Err(WriteReadError::DeadReply)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::DeadReply);
                 }
                 Some(Err(WriteReadError::ObjectNotFound)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::ObjectNotFound);
                 }
                 Some(Err(WriteReadError::FailedReply)) => {
                     error!("remote twoway {}", WriteReadError::FailedReply);
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::Unknown(1));
                 }
                 Some(Err(WriteReadError::FrozenReply)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::FrozenReply);
                 }
                 Some(Err(WriteReadError::AsyncBufferFull)) => {
                     sleep(Duration::from_millis(1));
                 }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     break Err(Error::Binder(err));
                 }
                 None => continue,
@@ -462,15 +489,29 @@ impl BinderDevice {
                     std::thread::yield_now();
                     continue;
                 }
-                Some(Err(WriteReadError::NoDevice)) => return Err(Error::Shutdown),
-                Some(Err(WriteReadError::DeadReply)) => return Err(Error::DeadReply),
-                Some(Err(WriteReadError::FrozenReply)) => return Err(Error::FrozenReply),
-                Some(Err(WriteReadError::ObjectNotFound)) => return Err(Error::ObjectNotFound),
+                Some(Err(WriteReadError::NoDevice)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
+                    return Err(Error::Shutdown);
+                }
+                Some(Err(WriteReadError::DeadReply)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
+                    return Err(Error::DeadReply);
+                }
+                Some(Err(WriteReadError::FrozenReply)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
+                    return Err(Error::FrozenReply);
+                }
+                Some(Err(WriteReadError::ObjectNotFound)) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
+                    return Err(Error::ObjectNotFound);
+                }
                 Some(Err(WriteReadError::FailedReply)) => {
                     error!("remote transact oneway {}", WriteReadError::FailedReply);
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     return Err(Error::Unknown(1));
                 }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
+                    unsafe { unmark_objects_as_pending_remote(self, &transaction) };
                     return Err(Error::Binder(err))
                 }
                 _ => return Ok(()),
@@ -509,7 +550,11 @@ impl Drop for BinderBackingMemMap {
     }
 }
 
-unsafe fn mark_objects_as_pending_remote(dev: &BinderDevice, transaction: &BinderTransactionData) {
+/// Walks the flat binder objects embedded in an outgoing transaction's payload.
+unsafe fn for_each_embedded_binder_object(
+    transaction: &BinderTransactionData,
+    mut f: impl FnMut(BinderObjectId),
+) {
     let main_data =
         slice::from_raw_parts(transaction.data.buffer as *const u8, transaction.data_size);
     let offsets = slice::from_raw_parts(
@@ -526,22 +571,47 @@ unsafe fn mark_objects_as_pending_remote(dev: &BinderDevice, transaction: &Binde
                 let flat_obj = binder_obj_bytes.as_ptr() as *const FlatBinderObject;
                 let flat_obj = unsafe { flat_obj.as_ref().unwrap() };
                 let id = BinderObjectId::from_raw(flat_obj.data.binder, flat_obj.cookie);
-                tracing::trace!(?id, "found binder object id in transaction");
-                if let Some(refcount) = dev.object_refcounts.get(&id) {
-                    if refcount.remote_strong_count.load(Ordering::Relaxed) == 0 {
-                        refcount.new_in_remote.store(true, Ordering::Relaxed);
-                    }
-                } else {
-                    tracing::warn!(
-                        ?id,
-                        "binder object found in transaction but it has no refcounts"
-                    );
-                }
+                f(id);
             }
-            _ => {
-                continue;
-            }
+            _ => continue,
         }
+    }
+}
+
+/// Speculatively marks every locally-owned object embedded in an about-to-be-sent
+/// transaction as awaiting a remote acquire. Must be paired with
+/// [`unmark_objects_as_pending_remote`] if the transaction turns out not to actually
+/// deliver (write failure, dead reply, peer death, ...), or those objects can never be
+/// freed again — see [`ObjectRefState::clear_pending_remote`].
+unsafe fn mark_objects_as_pending_remote(dev: &BinderDevice, transaction: &BinderTransactionData) {
+    unsafe {
+        for_each_embedded_binder_object(transaction, |id| {
+            tracing::trace!(?id, "found binder object id in transaction");
+            if let Some(refcount) = dev.object_refcounts.get(&id) {
+                refcount.mark_pending_remote();
+            } else {
+                tracing::warn!(
+                    ?id,
+                    "binder object found in transaction but it has no refcounts"
+                );
+            }
+        });
+    }
+}
+
+/// Rolls back [`mark_objects_as_pending_remote`] for a transaction that is now known to
+/// have failed, so a BR_ACQUIRE that will never arrive doesn't leave those objects
+/// permanently un-collectible.
+unsafe fn unmark_objects_as_pending_remote(
+    dev: &BinderDevice,
+    transaction: &BinderTransactionData,
+) {
+    unsafe {
+        for_each_embedded_binder_object(transaction, |id| {
+            if let Some(refcount) = dev.object_refcounts.get(&id) {
+                refcount.clear_pending_remote();
+            }
+        });
     }
 }
 
