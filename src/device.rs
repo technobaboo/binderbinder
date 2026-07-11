@@ -30,6 +30,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Instrument};
 
 pub struct Transaction {
@@ -132,7 +133,7 @@ pub struct BinderDevice {
     pub(crate) retained_services: DashMap<BinderObjectId, Box<dyn Any + Send + Sync>>,
     pub(crate) refs: DashMap<u32, Weak<BinderRef>>,
     pub(crate) weak_refs: DashMap<u32, Weak<WeakBinderRef>>,
-    pub(crate) death_notifications: DashMap<usize, Arc<Notify>>,
+    pub(crate) death_notifications: DashMap<usize, CancellationToken>,
     ctx_manager: ContextManagerBinderRef,
     // needed for safety
     _backing: BinderBackingMemMap,
@@ -512,7 +513,7 @@ impl BinderDevice {
                 }
                 Some(Err(WriteReadError::WriteReadIoctlFailed(err))) => {
                     unsafe { unmark_objects_as_pending_remote(self, &transaction) };
-                    return Err(Error::Binder(err))
+                    return Err(Error::Binder(err));
                 }
                 _ => return Ok(()),
             }
@@ -948,8 +949,8 @@ unsafe fn binder_write_read(
                 let v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                if let Some((_, notify)) = device.death_notifications.remove(&v) {
-                    notify.notify_waiters();
+                if let Some((_, death)) = device.death_notifications.remove(&v) {
+                    death.cancel();
                 } else {
                     warn!("got DeadBinder without having internal death_notification registered for it");
                 }

@@ -13,11 +13,11 @@ use std::{
     hash::Hash,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// Used to send or receive transactions, roughly maps onto the uapi `flat_binder_object`.
@@ -66,7 +66,7 @@ impl Debug for BinderRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BinderRef")
             .field("id", &self.id)
-            .field("dead", &self.dead)
+            .field("dead", &self.weak.death.is_cancelled())
             .finish()
     }
 }
@@ -149,15 +149,14 @@ impl Drop for BinderRef {
 pub struct WeakBinderRef {
     device: Arc<BinderDevice>,
     id: u32,
-    dead: Arc<AtomicBool>,
-    death_notify: Arc<Notify>,
+    death: CancellationToken,
 }
 
 impl Debug for WeakBinderRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeakBinderRef")
             .field("id", &self.id)
-            .field("dead", &self.dead)
+            .field("dead", &self.death.is_cancelled())
             .finish()
     }
 }
@@ -178,16 +177,10 @@ impl Eq for WeakBinderRef {}
 impl WeakBinderRef {
     /// future returns when the remote object died
     pub fn death_notification(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self.death_notify.clone();
-        let dead = self.dead.clone();
-        async move {
-            if !dead.load(Ordering::Relaxed) {
-                notify.notified().await
-            }
-        }
+        self.death.clone().cancelled_owned()
     }
     pub fn alive(&self) -> bool {
-        !self.dead.load(Ordering::Relaxed)
+        !self.death.is_cancelled()
     }
     pub fn upgrade(&self) -> Option<Arc<BinderRef>> {
         let handle = self.device.refs.get(&self.id).and_then(|v| v.upgrade());
@@ -207,19 +200,10 @@ impl WeakBinderRef {
             return port;
         }
         let death_notif_cookie = device.death_counter.fetch_add(1, Ordering::Relaxed);
-        let death_notify = Arc::new(Notify::new());
+        let death = CancellationToken::new();
         device
             .death_notifications
-            .insert(death_notif_cookie, death_notify.clone());
-        let dead = Arc::new(AtomicBool::new(false));
-        tokio::spawn({
-            let dead = dead.clone();
-            let notify = death_notify.clone();
-            async move {
-                notify.notified().await;
-                dead.store(true, Ordering::Relaxed);
-            }
-        });
+            .insert(death_notif_cookie, death.clone());
         unsafe {
             device.write_binder_struct_command(BinderCommand::INCREFS, &handle);
             device.write_binder_struct_command(
@@ -233,8 +217,7 @@ impl WeakBinderRef {
         let port = Arc::new(Self {
             device: device.clone(),
             id: handle,
-            dead,
-            death_notify,
+            death,
         });
         device.weak_refs.insert(handle, Arc::downgrade(&port));
         port
