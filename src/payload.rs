@@ -8,7 +8,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, instrument};
 
 use crate::{
     binder_object::{
@@ -229,6 +229,7 @@ pub struct PayloadReader {
     next_data_index: usize,
 }
 impl PayloadReader {
+    #[instrument(level = "trace", skip(self))]
     pub fn read_bytes(&mut self, num_bytes: usize) -> Result<&[u8], PayloadBytesReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
@@ -247,6 +248,7 @@ impl PayloadReader {
             Err(PayloadBytesReadError::OutOfBounds)
         }
     }
+    #[instrument(level = "trace", skip(self))]
     pub fn read_binder_ref(&mut self) -> Result<BinderObjectOrRef, PayloadBinderRefReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
@@ -273,9 +275,12 @@ impl PayloadReader {
         let object_or_ref = match flat_obj.hdr.type_ {
             BinderType::BINDER => {
                 let id = BinderObjectId::from_raw(unsafe { flat_obj.data.binder }, flat_obj.cookie);
+                let obj = BorrowedBinderObject::from_id(self.device.clone(), id);
+                if obj.is_none() {
+                    tracing::error!(?id, "failed to read owned binder object")
+                }
                 BinderObjectOrRef::Object(
-                    BorrowedBinderObject::from_id(self.device.clone(), id)
-                        .ok_or(PayloadBinderRefReadError::UnknownBinderObject)?,
+                    obj.ok_or(PayloadBinderRefReadError::UnknownBinderObject)?,
                 )
             }
             BinderType::WEAK_BINDER => BinderObjectOrRef::WeakObject(WeakBinderObject::from_id(
@@ -298,6 +303,7 @@ impl PayloadReader {
         self.next_data_index = offset + size_of::<FlatBinderObject>();
         Ok(object_or_ref)
     }
+    #[instrument(level = "trace", skip(self))]
     pub fn read_fd(&mut self) -> Result<(OwnedFd, usize), PayloadObjectReadError> {
         let offsets = self.offsets.as_mut();
         let data = &mut self.data;
@@ -319,6 +325,7 @@ impl PayloadReader {
         self.next_data_index = offset + size_of::<BinderFdObject>();
         Ok((fd, fd_obj.cookie))
     }
+    #[instrument(level = "trace", skip(self))]
     pub fn next_object_type(&self) -> Option<BinderObjectType> {
         let offsets = self.offsets.as_ref();
         let data = &self.data;
@@ -339,6 +346,7 @@ impl PayloadReader {
         })
     }
     /// includes align bytes
+    #[instrument(level = "trace", skip(self))]
     pub fn bytes_until_next_obj(&self) -> usize {
         let offsets = self.offsets.as_ref();
         let data = &self.data;
@@ -452,6 +460,7 @@ impl<T: Sized + 'static> PayloadReaderBuffer<T> {
     }
 }
 impl Drop for PayloadReader {
+    #[instrument(level = "trace", name = "PayloadReader::drop", skip(self))]
     fn drop(&mut self) {
         while let Some(obj_type) = self.next_object_type() {
             match obj_type {
@@ -459,7 +468,11 @@ impl Drop for PayloadReader {
                 | BinderObjectType::WeakBinderObject
                 | BinderObjectType::BinderRef
                 | BinderObjectType::WeakBinderRef => {
-                    _ = self.read_binder_ref();
+                    let v = self.read_binder_ref();
+                    // this is needed to not infinite loop when trying to read a dead object
+                    if v.is_err() {
+                        self.next_offset_index += 1;
+                    }
                 }
                 BinderObjectType::Fd => {
                     _ = self.read_fd();

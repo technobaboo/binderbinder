@@ -434,17 +434,26 @@ impl BinderDevice {
     ) -> Result<()> {
         let handler = self.objects.get(id).ok_or(Error::ObjectNotFound)?.clone();
         let payload = PayloadReader::from_builder(self.clone(), &data);
-        tokio::spawn(async move {
-            handler
-                .handle_one_way(Transaction {
-                    code,
-                    payload,
-                    sender_pid: process::getpid().as_raw_pid(),
-                    sender_euid: process::geteuid().as_raw(),
-                })
-                .instrument(trace_span!("Local oneway transaction"))
-                .await
-        });
+        let handler_type = handler.type_name();
+        tokio::spawn(
+            async move {
+                handler
+                    .handle_one_way(Transaction {
+                        code,
+                        payload,
+                        sender_pid: process::getpid().as_raw_pid(),
+                        sender_euid: process::geteuid().as_raw(),
+                    })
+                    .instrument(trace_span!("Local oneway transaction"))
+                    .await
+            }
+            .instrument(trace_span!(
+                "self transact_one_way",
+                handler_type,
+                ?id,
+                code
+            )),
+        );
         Ok(())
     }
     #[instrument(
@@ -1038,6 +1047,7 @@ pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
 }
 
 pub(crate) trait ErasedTransactionHandler: Any + Debug + Send + Sync + 'static {
+    fn type_name(&self) -> &'static str;
     fn handle(
         self: Arc<Self>,
         transaction: Transaction,
@@ -1049,6 +1059,9 @@ pub(crate) trait ErasedTransactionHandler: Any + Debug + Send + Sync + 'static {
 }
 
 impl<T: TransactionHandler> ErasedTransactionHandler for T {
+    fn type_name(&self) -> &'static str {
+        self.type_name()
+    }
     fn handle(
         self: Arc<Self>,
         transaction: Transaction,
