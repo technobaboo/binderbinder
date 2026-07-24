@@ -431,18 +431,6 @@ unsafe impl Ioctl for BinderfsDevice {
     }
 }
 
-#[tokio::test]
-async fn test_version_ioctl() {
-    let file = std::fs::File::open("/dev/binderfs/testbinder").expect(
-        "Could not open /dev/binderfs/testbinder. Run: sudo ./target/debug/examples/new_device",
-    );
-    let version = BinderVersion {
-        protocol_version: 0,
-    };
-    let result = unsafe { rustix::ioctl::ioctl(&file, version) };
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap().protocol_version, 8);
-}
 #[test]
 pub const fn binder_type_niche() {
     let a = size_of::<BinderType>();

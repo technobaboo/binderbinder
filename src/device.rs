@@ -861,13 +861,29 @@ unsafe fn binder_write_read(
                             offsets: reply_data.offset_buffer_ptr() as _,
                         },
                     };
+                    // Protect any freshly-embedded local objects from a
+                    // premature `strong_refs_hit_zero` firing (via
+                    // `drop(reply_data)` below) before the remote side has
+                    // actually sent BR_ACQUIRE for them — mirrors the same
+                    // marking done for outgoing calls in
+                    // `remote_transact_blocking`/`remote_transact_one_way`.
+                    // Cleared later by `increase_remote()` once the real
+                    // acquire arrives.
+                    unsafe { mark_objects_as_pending_remote(&device, &reply) };
                     let mut bytes = Vec::new();
                     bytes.extend_from_slice(&BinderCommand::REPLY.as_u32().to_ne_bytes());
                     bytes.extend_from_slice(slice::from_raw_parts(
                         &raw const reply as _,
                         size_of_val(&reply),
                     ));
-                    write_binder_command(dev_fd, &bytes).unwrap();
+                    if let Err(e) = write_binder_command(dev_fd, &bytes) {
+                        // The reply never made it out, so no BR_ACQUIRE will
+                        // ever arrive for the objects we just marked —
+                        // roll the marking back so they're still
+                        // collectible instead of stuck pending forever.
+                        error!("failed to write BC_REPLY: {e}");
+                        unsafe { unmark_objects_as_pending_remote(&device, &reply) };
+                    }
                     drop(reply_data);
                 }
             }
@@ -1080,9 +1096,8 @@ impl<T: TransactionHandler> ErasedTransactionHandler for T {
 mod tests {
     use super::*;
     use crate::payload::PayloadBuilder;
+    use crate::test_pool::PoolNode;
     use std::sync::Arc;
-
-    const BINDER_PATH: &str = "/dev/binderfs/testbinder";
 
     #[derive(Debug)]
     struct NoopService;
@@ -1094,9 +1109,13 @@ mod tests {
         async fn handle_one_way(self: Arc<Self>, _tx: Transaction) {}
     }
 
+    /// These tests never call `set_context_manager`, so nothing else on the
+    /// node could conflict with them — the node lock only needs to be held
+    /// long enough to open the device, and is released as soon as `node`
+    /// goes out of scope.
     fn open_device() -> Arc<BinderDevice> {
-        BinderDevice::new(BINDER_PATH)
-            .expect("open testbinder — run the new_device example as root first")
+        let node = PoolNode::acquire();
+        BinderDevice::new(&node.path).expect("open pool node")
     }
 
     /// A plain BinderObject cleans up both maps on drop.

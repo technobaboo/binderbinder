@@ -5,6 +5,7 @@ pub mod error;
 pub mod fs;
 pub mod payload;
 pub mod sys;
+pub mod test_pool;
 
 pub use device::{BinderDevice, TransactionHandler};
 pub use error::{Error, Result};

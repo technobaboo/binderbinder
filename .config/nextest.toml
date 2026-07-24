@@ -1,0 +1,12 @@
+# cargo-nextest config for the binder stress suite.
+#
+# Each test runs in its own OS process under nextest, which matters here:
+# a test that wedges an fd or panics mid-transaction can't take down
+# unrelated tests the way a thread panicking inside plain `cargo test` can.
+#
+# `test-threads` is capped to the size of the pre-provisioned device-node
+# pool (see `src/test_pool.rs` / `examples/setup_test_pool.rs`, default 16)
+# so contention for pool nodes is a short queue rather than routine — bump
+# this alongside BINDERBINDER_TEST_POOL_SIZE if you provision a bigger pool.
+[profile.default]
+test-threads = 16
