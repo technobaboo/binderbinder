@@ -24,7 +24,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::pin::Pin;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::sleep;
 use std::time::Duration;
@@ -40,15 +40,52 @@ pub struct Transaction {
     pub sender_euid: RawUid,
 }
 
+/// `local`/`remote`/`pending` always move together as one atomic unit — see
+/// the comment on [`ObjectRefState::counts`] for why that matters.
+#[derive(Debug, Default, Clone, Copy)]
+struct RefCounts {
+    local: u32,
+    remote: u32,
+    /// Number of in-flight sends of this object that haven't yet been
+    /// confirmed (by their real BR_ACQUIRE landing) or rolled back (because
+    /// the send failed). Guards against reporting a premature zero between
+    /// a sender's transient local ref dropping and that confirmation
+    /// arriving. See [`ObjectRefState::mark_pending_remote`].
+    ///
+    /// This has to be a *count*, not a single flag: the same object can be
+    /// embedded in more than one concurrent outgoing send before either is
+    /// confirmed (e.g. handed to two different clients at once). A bool
+    /// can't tell those apart — one send failing and rolling back would
+    /// clear the *other* send's still-legitimate guard too, letting
+    /// `decrease_local` report a zero while that other send is still
+    /// genuinely in flight (the object gets torn down before the transfer
+    /// that's about to reference it even lands).
+    pending: u32,
+}
+impl RefCounts {
+    fn total(&self) -> u32 {
+        self.local + self.remote + self.pending
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ObjectRefState {
     obj_id: BinderObjectId,
-    local_strong_count: AtomicU32,
-    remote_strong_count: AtomicU32,
-    new_in_remote: AtomicBool,
-    /// `local + remote`, plus one extra unit while `new_in_remote` guards an
-    /// in-flight send awaiting its real BR_ACQUIRE. Zero means genuinely no
-    /// strong refs outstanding.
+    /// `local`, `remote`, and `pending` used to be three independent
+    /// atomics, each mutating method reading the *other* two via plain
+    /// `.load()`s to decide what to publish. That's racy: two concurrent
+    /// updates (e.g. the owner dropping its local ref right as the remote
+    /// side's BR_RELEASE lands) can each read a stale value for the field
+    /// the other just changed, so each one computes and publishes a
+    /// nonzero total — and since nothing else will ever mutate this
+    /// object's counts again once both sides have genuinely let go, the
+    /// real zero is never observed and the object sticks around forever.
+    /// A single mutex serializes every mutation into one consistent
+    /// snapshot, so the *last* transition to true zero is always the one
+    /// that gets published.
+    counts: std::sync::Mutex<RefCounts>,
+    /// `local + remote`, plus one extra unit while `pending` is set. Zero
+    /// means genuinely no strong refs outstanding.
     ///
     /// This used to be a pair of `Notify`s (one for hit-zero, one for
     /// not-zero), fired as edge events via `notify_waiters()`. That's
@@ -67,69 +104,91 @@ impl ObjectRefState {
     pub(crate) fn new(obj_id: BinderObjectId) -> Self {
         Self {
             obj_id,
-            local_strong_count: AtomicU32::new(0),
-            remote_strong_count: AtomicU32::new(0),
-            new_in_remote: AtomicBool::new(false),
+            counts: std::sync::Mutex::new(RefCounts::default()),
             strong_count: watch::Sender::new(0),
         }
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<u32> {
         self.strong_count.subscribe()
     }
-    fn publish(&self, local: u32, remote: u32, pending: bool) {
-        let total = local + remote + pending as u32;
-        tracing::debug!(?self.obj_id, total, "publishing strong count");
-        self.strong_count.send_replace(total);
+    /// Applies `f` to the current counts under the lock and publishes the
+    /// resulting total, returning the post-update snapshot.
+    ///
+    /// The publish (`send_replace`) has to happen *while still holding the
+    /// lock*, not after releasing it. If it happened after, two concurrent
+    /// callers could lock/mutate in order A-then-B (B's state is the true
+    /// latest) but get preempted and reach their own `send_replace` calls
+    /// in order B-then-A — A's older snapshot would overwrite B's correct,
+    /// more recent one, and since nothing else will ever mutate this
+    /// object's counts again once it's genuinely done, that stale
+    /// published value sticks forever. Publishing inside the lock forces
+    /// publish order to match mutation order.
+    fn update(&self, f: impl FnOnce(&mut RefCounts)) -> RefCounts {
+        let mut counts = self.counts.lock().unwrap();
+        f(&mut counts);
+        let snapshot = *counts;
+        tracing::debug!(?self.obj_id, total = snapshot.total(), "publishing strong count");
+        self.strong_count.send_replace(snapshot.total());
+        snapshot
     }
     pub(crate) fn increase_local(&self) {
-        let v = self.local_strong_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let remote = self.remote_strong_count.load(Ordering::Relaxed);
-        let pending = self.new_in_remote.load(Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v, "increasing local strong ref");
-        self.publish(v, remote, pending);
+        let snapshot = self.update(|c| c.local += 1);
+        tracing::debug!(?self.obj_id, new_count = snapshot.local, "increasing local strong ref");
     }
     pub(crate) fn decrease_local(&self) {
-        let v = self.local_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        let remote = self.remote_strong_count.load(Ordering::Relaxed);
-        let pending = self.new_in_remote.load(Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v, "decreasing local strong ref");
-        self.publish(v, remote, pending);
+        let snapshot = self.update(|c| c.local -= 1);
+        tracing::debug!(?self.obj_id, new_count = snapshot.local, "decreasing local strong ref");
     }
     pub(crate) fn increase_remote(&self) {
-        let v = self.remote_strong_count.fetch_add(1, Ordering::Relaxed) + 1;
-        self.new_in_remote.store(false, Ordering::Relaxed);
-        let local = self.local_strong_count.load(Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v, "increasing remote strong ref");
-        self.publish(local, v, false);
+        let snapshot = self.update(|c| {
+            c.remote += 1;
+            // A *full* reset, not a decrement-by-one: the kernel only ever
+            // queues a BR_ACQUIRE for the actual 0→1 transition, so if
+            // several concurrent sends all raced `mark_pending_remote`
+            // while remote was still 0, only one of them "wins" and gets
+            // its own ACQUIRE — the rest never individually get one to
+            // consume their credit. But that's fine: once remote is
+            // confirmed established, none of those racing credits are
+            // needed anymore regardless of how many there were, since
+            // remote alone now keeps the total nonzero. Decrementing by
+            // just one here would leave the losing racers' credits stuck
+            // forever.
+            c.pending = 0;
+        });
+        tracing::debug!(?self.obj_id, new_count = snapshot.remote, "increasing remote strong ref");
     }
     pub(crate) fn decrease_remote(&self) {
-        let v = self.remote_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        let local = self.local_strong_count.load(Ordering::Relaxed);
-        let pending = self.new_in_remote.load(Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v, "decreasing remote strong ref");
-        self.publish(local, v, pending);
+        let snapshot = self.update(|c| c.remote -= 1);
+        tracing::debug!(?self.obj_id, new_count = snapshot.remote, "decreasing remote strong ref");
     }
     /// About to hand this object to a remote process in a transaction: guards against
     /// `decrease_local` reporting a premature zero between the sender's
     /// transient local ref dropping and the matching BR_ACQUIRE coming back.
+    ///
+    /// Only guards while `remote == 0`: once the object already has an
+    /// established remote ref, `decrease_local` can't zero the total on its
+    /// own (remote alone keeps it nonzero), and re-sending an
+    /// already-acquired object to another holder doesn't generate a fresh
+    /// BR_ACQUIRE from the kernel (it only queues one on the first 0→1
+    /// transition) — so a guard taken out here would never get consumed by
+    /// `increase_remote` and would sit stuck forever.
     pub(crate) fn mark_pending_remote(&self) {
-        if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
-            self.new_in_remote.store(true, Ordering::Relaxed);
-            let local = self.local_strong_count.load(Ordering::Relaxed);
-            self.publish(local, 0, true);
-        }
+        self.update(|c| {
+            if c.remote == 0 {
+                c.pending += 1;
+            }
+        });
     }
-    /// Roll back a `mark_pending_remote` whose transaction never completed (write failed,
-    /// dead reply, peer died mid-flight, ...), so the BR_ACQUIRE that would normally clear
-    /// it is never going to arrive. Without this, `new_in_remote` stays stuck `true` forever
-    /// and the object could never be reported as genuinely unreferenced again.
+    /// Roll back this send's own `mark_pending_remote` after it failed to
+    /// complete (write failed, dead reply, peer died mid-flight, ...), so
+    /// the BR_ACQUIRE that would normally clear it is never going to
+    /// arrive. Only decrements this send's own unit of guard — any other
+    /// concurrent in-flight send of the same object keeps its protection.
+    /// Without this at all, `pending` would stay stuck above zero forever
+    /// and the object could never be reported as genuinely unreferenced
+    /// again.
     pub(crate) fn clear_pending_remote(&self) {
-        if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
-            self.new_in_remote.store(false, Ordering::Relaxed);
-            let local = self.local_strong_count.load(Ordering::Relaxed);
-            tracing::debug!(?self.obj_id, "clearing pending remote after failed remote send");
-            self.publish(local, 0, false);
-        }
+        self.update(|c| c.pending = c.pending.saturating_sub(1));
     }
 }
 
@@ -1279,5 +1338,114 @@ mod tests {
             weak_handler.upgrade().is_none(),
             "handler Arc not fully dropped"
         );
+    }
+
+    /// White-box regression test for a "dropped too early" bug: the same
+    /// object embedded in two concurrent outgoing sends, one of which fails
+    /// and rolls back. The failing send's rollback must only cancel its own
+    /// guard, not the other (still legitimately in-flight) send's — driven
+    /// directly against `ObjectRefState` since reliably forcing one of two
+    /// concurrent real kernel sends to fail while the other succeeds isn't
+    /// practical to arrange from outside the crate.
+    #[test]
+    fn concurrent_pending_sends_do_not_cross_cancel() {
+        let id = BinderObjectId { id: 1, cookie: 0 };
+        let state = ObjectRefState::new(id);
+        let mut rx = state.subscribe();
+
+        // Two concurrent sends of the same never-before-remote object, both
+        // guarding against the object's local count (transiently 0 between
+        // the two marks below) hitting a premature zero.
+        state.mark_pending_remote(); // send A
+        state.mark_pending_remote(); // send B
+        assert_eq!(*rx.borrow_and_update(), 2, "both sends should be guarded");
+
+        // Send B fails and rolls back its own guard — send A is still in
+        // flight and must remain protected.
+        state.clear_pending_remote();
+        assert_eq!(
+            *rx.borrow_and_update(),
+            1,
+            "rolling back send B must not cancel send A's still-legitimate guard"
+        );
+
+        // Send A's real BR_ACQUIRE lands.
+        state.increase_remote();
+        assert_eq!(*rx.borrow_and_update(), 1, "send A's remote ref is now established");
+
+        state.decrease_remote();
+        assert_eq!(*rx.borrow_and_update(), 0, "genuinely nothing outstanding now");
+    }
+
+    /// Several concurrent sends can all race `mark_pending_remote` while
+    /// `remote` is still 0, but the kernel only ever queues *one* BR_ACQUIRE
+    /// for the actual 0->1 transition — the "losing" racers never get an
+    /// individual ACQUIRE of their own to consume their credit.
+    /// `increase_remote` must resolve *all* of them at once (a full reset),
+    /// not just one, or the losers' credits get stuck forever and the
+    /// object never reports a real zero later.
+    #[test]
+    fn single_acquire_resolves_all_racing_pending_sends() {
+        let id = BinderObjectId { id: 2, cookie: 0 };
+        let state = ObjectRefState::new(id);
+        let mut rx = state.subscribe();
+
+        // Three concurrent first-time sends of the same object, all racing.
+        state.mark_pending_remote();
+        state.mark_pending_remote();
+        state.mark_pending_remote();
+        assert_eq!(*rx.borrow_and_update(), 3, "all three should be guarded");
+
+        // Only one of them actually wins the race to be the real 0->1
+        // transition in the kernel; only one BR_ACQUIRE ever arrives.
+        state.increase_remote();
+        assert_eq!(
+            *rx.borrow_and_update(),
+            1,
+            "one ACQUIRE must resolve every racing send's guard at once, not just one"
+        );
+
+        // The object genuinely goes away later — must still reach zero,
+        // not get stuck on the other two racers' never-consumed credits.
+        state.decrease_remote();
+        assert_eq!(*rx.borrow_and_update(), 0, "must reach true zero, not stay stuck");
+    }
+
+    /// Isolates whether the watch/mutex plumbing itself (as opposed to
+    /// anything binder/kernel-specific) can drop an update: hammer
+    /// `ObjectRefState` from real OS threads (matching how looper threads
+    /// call it) while a tokio task awaits `wait_for` on a subscribed
+    /// receiver, many times over, looking for any hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn watch_survives_concurrent_os_thread_hammering() {
+        for round in 0..2000 {
+            let id = BinderObjectId { id: round, cookie: 0 };
+            let state = Arc::new(ObjectRefState::new(id));
+            let mut rx = state.subscribe();
+
+            state.increase_local();
+            let hit_zero = async {
+                rx.wait_for(|count| *count == 0).await.unwrap();
+            };
+
+            let s1 = state.clone();
+            let s2 = state.clone();
+            let t1 = std::thread::spawn(move || {
+                s1.increase_local();
+                s1.decrease_local();
+            });
+            let t2 = std::thread::spawn(move || s2.decrease_local());
+
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), hit_zero).await;
+            t1.join().unwrap();
+            t2.join().unwrap();
+            if outcome.is_err() {
+                let counts = *state.counts.lock().unwrap();
+                panic!(
+                    "round {round}: watch never observed zero; current value = {}, counts = {counts:?}",
+                    *rx.borrow()
+                );
+            }
+        }
     }
 }

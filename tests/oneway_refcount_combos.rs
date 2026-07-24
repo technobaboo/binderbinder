@@ -207,6 +207,45 @@ fn oneway_concurrent_create_and_drop_cycles() {
     ));
 }
 
+/// Races the owner dropping its own local ref against the remote side
+/// (a genuinely separate process) dropping its independently-acquired ref,
+/// for many objects at once, with *no* artificial delay separating the two
+/// drops (unlike `oneway_held_ref_delays_release_until_dropped`, which
+/// deliberately gives the remote side a 200ms head start). This targets a
+/// stale-cross-read race in `ObjectRefState`: if `decrease_local` and
+/// `decrease_remote` for the same object run concurrently, each reading the
+/// *other* counter to decide what to publish, both can observe a stale
+/// pre-decrement value and neither ever reports the true final zero.
+#[test]
+fn oneway_owner_and_remote_race_to_drop() {
+    let node = PoolNode::acquire();
+    let result = support::fork_combo(
+        &node,
+        become_sink,
+        |device: Arc<BinderDevice>| async move {
+            let mut tasks = Vec::new();
+            for _ in 0..64 {
+                let device = device.clone();
+                tasks.push(tokio::spawn(async move {
+                    let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
+                    let hit_zero = leaf_ref.strong_refs_hit_zero();
+                    drop(leaf_ref);
+                    tokio::time::timeout(Duration::from_secs(5), hit_zero)
+                        .await
+                        .expect("strong_refs_hit_zero stuck");
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        },
+    );
+    assert!(matches!(
+        result.child_status,
+        nix::sys::wait::WaitStatus::Exited(_, 0)
+    ));
+}
+
 /// Same object, sent via oneway repeatedly without ever dropping our own
 /// local ref in between — exercises the *not-first-ref* path (the node
 /// already has a strong ref in the target process, so the kernel doesn't
