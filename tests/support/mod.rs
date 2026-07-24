@@ -26,6 +26,25 @@ pub use binderbinder::test_pool::PoolNode;
 
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
+use tracing::Instrument;
+
+/// Debug-only: tag every trace line with role + pid so a full-suite failure's
+/// interleaved service/client output can be told apart. Guarded by an env
+/// var so it doesn't fight with any other subscriber setup.
+fn init_trace_subscriber(role: &str) {
+    if std::env::var_os("BINDERBINDER_TEST_TRACE").is_none() {
+        return;
+    }
+    let pid = std::process::id();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+    tracing::info!("{role} pid={pid} trace subscriber initialized");
+}
 
 /// Result of a `fork_combo` run: the client role's return value, plus the
 /// forked service process's exit status (`WaitStatus::Exited(_, 0)` is
@@ -70,15 +89,19 @@ where
 
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
+            init_trace_subscriber("SERVICE");
             drop(ready_r);
             drop(done_w);
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = tokio::runtime::Runtime::new().expect("build child runtime");
-                let keep_alive = rt.block_on(async {
-                    let device = BinderDevice::new(&path).expect("open device (service role)");
-                    service_role(device).await
-                });
+                let keep_alive = rt.block_on(
+                    async {
+                        let device = BinderDevice::new(&path).expect("open device (service role)");
+                        service_role(device).await
+                    }
+                    .instrument(tracing::info_span!("service", pid = std::process::id())),
+                );
 
                 // Signal readiness only after setup succeeded, then block
                 // until the client is done. `keep_alive` (e.g. the
@@ -96,6 +119,7 @@ where
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
         ForkResult::Parent { child } => {
+            init_trace_subscriber("CLIENT");
             drop(ready_w);
             drop(done_r);
 
@@ -105,10 +129,13 @@ where
             drop(ready_r);
 
             let rt = tokio::runtime::Runtime::new().expect("build parent runtime");
-            let client = rt.block_on(async {
-                let device = BinderDevice::new(&path).expect("open device (client role)");
-                client_role(device).await
-            });
+            let client = rt.block_on(
+                async {
+                    let device = BinderDevice::new(&path).expect("open device (client role)");
+                    client_role(device).await
+                }
+                .instrument(tracing::info_span!("client", pid = std::process::id())),
+            );
 
             write(&done_w, &[1]).expect("signal done");
             drop(done_w);

@@ -876,13 +876,37 @@ unsafe fn binder_write_read(
                         &raw const reply as _,
                         size_of_val(&reply),
                     ));
-                    if let Err(e) = write_binder_command(dev_fd, &bytes) {
-                        // The reply never made it out, so no BR_ACQUIRE will
-                        // ever arrive for the objects we just marked —
-                        // roll the marking back so they're still
-                        // collectible instead of stuck pending forever.
-                        error!("failed to write BC_REPLY: {e}");
-                        unsafe { unmark_objects_as_pending_remote(&device, &reply) };
+                    // Sending BC_REPLY with a freshly-embedded local object can make
+                    // the kernel queue our own BR_ACQUIRE for it onto *this exact*
+                    // kernel thread's work list as a side effect of processing the
+                    // write (binder_inc_node_nilocked in the kernel enqueues it to
+                    // the calling thread's `thread->todo`, which always has
+                    // priority over the process-wide queue on the next read). If we
+                    // write via a read-less ioctl (like plain `write_binder_command`,
+                    // which sets read_size=0), that queued BR_ACQUIRE just sits
+                    // there competing with whatever new incoming transaction this
+                    // thread picks up next — under enough concurrent load, this
+                    // thread can keep being handed fresh transactions instead of
+                    // ever coming back around to drain its own queue, leaving the
+                    // object's `new_in_remote` guard (and thus
+                    // `strong_refs_hit_zero`) stuck forever. Doing the write and the
+                    // very next read in the *same* ioctl call (like every other
+                    // looper turn does) guarantees the kernel processes this
+                    // thread's own queued BR_ACQUIRE immediately, in this call.
+                    match unsafe { binder_write_read(dev_fd, Some(&bytes), &Arc::downgrade(&device), runtime) }
+                    {
+                        Some(Ok(_)) => {
+                            error!("looper unexpectedly received a reply while sending BC_REPLY, ignoring");
+                        }
+                        Some(Err(e)) => {
+                            // The reply never made it out, so no BR_ACQUIRE will
+                            // ever arrive for the objects we just marked —
+                            // roll the marking back so they're still
+                            // collectible instead of stuck pending forever.
+                            error!("failed to write BC_REPLY: {e}");
+                            unsafe { unmark_objects_as_pending_remote(&device, &reply) };
+                        }
+                        None => {}
                     }
                     drop(reply_data);
                 }
