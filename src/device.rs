@@ -29,7 +29,7 @@ use std::sync::{Arc, Weak};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Instrument};
 
@@ -46,8 +46,22 @@ pub(crate) struct ObjectRefState {
     local_strong_count: AtomicU32,
     remote_strong_count: AtomicU32,
     new_in_remote: AtomicBool,
-    pub(crate) strong_count_hit_zero: Arc<Notify>,
-    pub(crate) strong_count_not_zero: Arc<Notify>,
+    /// `local + remote`, plus one extra unit while `new_in_remote` guards an
+    /// in-flight send awaiting its real BR_ACQUIRE. Zero means genuinely no
+    /// strong refs outstanding.
+    ///
+    /// This used to be a pair of `Notify`s (one for hit-zero, one for
+    /// not-zero), fired as edge events via `notify_waiters()`. That's
+    /// fundamentally the wrong shape for "wait until this state holds":
+    /// `notify_waiters()` only wakes tasks *already polling* at the instant
+    /// it's called — a task that subscribes after the fact (as
+    /// `strong_refs_hit_zero()` used to, since it only called `.notified()`
+    /// on first poll instead of at construction) waits forever for an edge
+    /// that already happened and won't happen again. A `watch` is
+    /// level-triggered instead: `Receiver::wait_for` always checks the
+    /// *current* value first, so subscribing late still observes the right
+    /// outcome instead of hanging.
+    strong_count: watch::Sender<u32>,
 }
 impl ObjectRefState {
     pub(crate) fn new(obj_id: BinderObjectId) -> Self {
@@ -56,68 +70,65 @@ impl ObjectRefState {
             local_strong_count: AtomicU32::new(0),
             remote_strong_count: AtomicU32::new(0),
             new_in_remote: AtomicBool::new(false),
-            strong_count_hit_zero: Arc::new(Notify::new()),
-            strong_count_not_zero: Arc::new(Notify::new()),
+            strong_count: watch::Sender::new(0),
         }
     }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u32> {
+        self.strong_count.subscribe()
+    }
+    fn publish(&self, local: u32, remote: u32, pending: bool) {
+        let total = local + remote + pending as u32;
+        tracing::debug!(?self.obj_id, total, "publishing strong count");
+        self.strong_count.send_replace(total);
+    }
     pub(crate) fn increase_local(&self) {
-        let v = self.local_strong_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v + 1,"increasing local strong ref");
-        if v == 0 && self.remote_strong_count.load(Ordering::Relaxed) == 0 {
-            tracing::debug!(?self.obj_id, "sending strong not zero from local");
-            self.strong_count_not_zero.notify_waiters();
-        }
+        let v = self.local_strong_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let remote = self.remote_strong_count.load(Ordering::Relaxed);
+        let pending = self.new_in_remote.load(Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v, "increasing local strong ref");
+        self.publish(v, remote, pending);
     }
     pub(crate) fn decrease_local(&self) {
         let v = self.local_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        tracing::debug!(?self.obj_id, new_count = v,"decreasing local strong ref");
-        if v == 0
-            && self.remote_strong_count.load(Ordering::Relaxed) == 0
-            && !self.new_in_remote.load(Ordering::Relaxed)
-        {
-            tracing::debug!(?self.obj_id,"sending strong hit zero from local");
-            self.strong_count_hit_zero.notify_waiters();
-        }
+        let remote = self.remote_strong_count.load(Ordering::Relaxed);
+        let pending = self.new_in_remote.load(Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v, "decreasing local strong ref");
+        self.publish(v, remote, pending);
     }
     pub(crate) fn increase_remote(&self) {
-        let v = self.remote_strong_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(?self.obj_id, new_count = v + 1,"increasing remote strong ref");
-        if v == 0
-            && self.local_strong_count.load(Ordering::Relaxed) == 0
-            && !self.new_in_remote.load(Ordering::Relaxed)
-        {
-            tracing::debug!(?self.obj_id,"sending strong not zero from remote");
-            self.strong_count_not_zero.notify_waiters();
-        }
+        let v = self.remote_strong_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.new_in_remote.store(false, Ordering::Relaxed);
+        let local = self.local_strong_count.load(Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v, "increasing remote strong ref");
+        self.publish(local, v, false);
     }
     pub(crate) fn decrease_remote(&self) {
         let v = self.remote_strong_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        tracing::debug!(?self.obj_id, new_count = v,"decreasing remote strong ref");
-        if v == 0 && self.local_strong_count.load(Ordering::Relaxed) == 0 {
-            tracing::debug!(?self.obj_id,"sending strong hit zero from remote");
-            self.strong_count_hit_zero.notify_waiters();
-        }
+        let local = self.local_strong_count.load(Ordering::Relaxed);
+        let pending = self.new_in_remote.load(Ordering::Relaxed);
+        tracing::debug!(?self.obj_id, new_count = v, "decreasing remote strong ref");
+        self.publish(local, v, pending);
     }
     /// About to hand this object to a remote process in a transaction: guards against
-    /// `decrease_local` firing `strong_count_hit_zero` prematurely between the sender's
+    /// `decrease_local` reporting a premature zero between the sender's
     /// transient local ref dropping and the matching BR_ACQUIRE coming back.
     pub(crate) fn mark_pending_remote(&self) {
         if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
             self.new_in_remote.store(true, Ordering::Relaxed);
+            let local = self.local_strong_count.load(Ordering::Relaxed);
+            self.publish(local, 0, true);
         }
     }
     /// Roll back a `mark_pending_remote` whose transaction never completed (write failed,
     /// dead reply, peer died mid-flight, ...), so the BR_ACQUIRE that would normally clear
     /// it is never going to arrive. Without this, `new_in_remote` stays stuck `true` forever
-    /// and `decrease_local` can never fire `strong_count_hit_zero` again.
+    /// and the object could never be reported as genuinely unreferenced again.
     pub(crate) fn clear_pending_remote(&self) {
         if self.remote_strong_count.load(Ordering::Relaxed) == 0 {
             self.new_in_remote.store(false, Ordering::Relaxed);
-            if self.local_strong_count.load(Ordering::Relaxed) == 0 {
-                tracing::debug!(?self.obj_id, "sending strong hit zero after failed remote send");
-                self.strong_count_hit_zero.notify_waiters();
-            }
+            let local = self.local_strong_count.load(Ordering::Relaxed);
+            tracing::debug!(?self.obj_id, "clearing pending remote after failed remote send");
+            self.publish(local, 0, false);
         }
     }
 }
@@ -1216,13 +1227,12 @@ mod tests {
         let service_ref = obj.to_service();
         let hit_zero = service_ref.strong_refs_hit_zero();
 
-        // Drop on a separate task so hit_zero is polled (registering its waiter) first.
-        // notify_waiters() only wakes already-registered waiters; if we dropped inline the
-        // notification could fire before notified() is ever called inside the future.
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            drop(service_ref);
-        });
+        // Unlike the old `Notify`-based implementation, dropping inline
+        // (before `hit_zero` is ever polled) is safe: `strong_refs_hit_zero`
+        // subscribes to the underlying `watch` eagerly, and `wait_for`
+        // checks the *current* value first rather than only catching an
+        // edge it happened to be listening for.
+        drop(service_ref);
 
         tokio::time::timeout(std::time::Duration::from_millis(500), hit_zero)
             .await

@@ -409,17 +409,16 @@ impl<H: TransactionHandler> BinderObject<H> {
         let obj_ref =
             BinderObjectRef::from_id(device.clone(), id).expect("holding all required refs");
 
-        // Subscribe before spawning so notify_waiters() fired before the task's first poll
-        // is not lost. Notified registers the listener at construction, not at .await.
-        let hit_zero_notified = device
-            .object_refcounts
-            .get(&id)
-            .map(|v| v.strong_count_hit_zero.clone().notified_owned());
+        // A `watch::Receiver` always reflects the sender's *current* value,
+        // so it doesn't matter whether we grab it before or after the
+        // spawn — unlike the old `Notify`-based version of this, there's no
+        // window where an already-fired state gets missed.
+        let hit_zero_rx = device.object_refcounts.get(&id).map(|v| v.subscribe());
 
         // Spawn a task to clean up when strong refs hit zero
         tokio::spawn(async move {
-            if let Some(notified) = hit_zero_notified {
-                notified.await;
+            if let Some(mut rx) = hit_zero_rx {
+                let _ = rx.wait_for(|count| *count == 0).await;
             }
             // Remove from retained_services, which drops the guard, which removes from objects
             device.retained_services.remove(&id);
@@ -434,27 +433,19 @@ impl<H: TransactionHandler> BinderObject<H> {
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_hit_zero.clone());
+        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
         async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|count| *count == 0).await;
             }
         }
     }
     /// Binder strong refs increased from zero to above zero.
     pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_not_zero.clone());
+        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
         async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|count| *count != 0).await;
             }
         }
     }
@@ -670,27 +661,19 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_hit_zero.clone());
+        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
         async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|count| *count == 0).await;
             }
         }
     }
     /// Binder strong refs increased from zero to above zero.
     pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let notify = self
-            .device
-            .object_refcounts
-            .get(&self.id)
-            .map(|r| r.strong_count_not_zero.clone());
+        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
         async move {
-            if let Some(notify) = notify {
-                notify.notified().await;
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|count| *count != 0).await;
             }
         }
     }
