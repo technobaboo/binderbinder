@@ -150,6 +150,7 @@ pub struct WeakBinderRef {
     device: Arc<BinderDevice>,
     id: u32,
     death: CancellationToken,
+    death_notif_cookie: usize,
 }
 
 impl Debug for WeakBinderRef {
@@ -218,6 +219,7 @@ impl WeakBinderRef {
             device: device.clone(),
             id: handle,
             death,
+            death_notif_cookie,
         });
         device.weak_refs.insert(handle, Arc::downgrade(&port));
         port
@@ -244,6 +246,13 @@ impl TransactionTargetImpl for WeakBinderRef {
 impl Drop for WeakBinderRef {
     fn drop(&mut self) {
         unsafe {
+            self.device.write_binder_struct_command(
+                BinderCommand::CLEAR_DEATH_NOTIFICATION,
+                &BinderHandleCookie {
+                    handle: self.handle(),
+                    cookie: self.death_notif_cookie,
+                },
+            );
             self.device
                 .write_binder_struct_command(BinderCommand::DECREFS, &self.handle());
         }
@@ -433,7 +442,11 @@ impl<H: TransactionHandler> BinderObject<H> {
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
-        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
+        let rx = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.subscribe());
         async move {
             if let Some(mut rx) = rx {
                 let _ = rx.wait_for(|count| *count == 0).await;
@@ -442,7 +455,11 @@ impl<H: TransactionHandler> BinderObject<H> {
     }
     /// Binder strong refs increased from zero to above zero.
     pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
+        let rx = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.subscribe());
         async move {
             if let Some(mut rx) = rx {
                 let _ = rx.wait_for(|count| *count != 0).await;
@@ -661,7 +678,11 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
     }
     /// Binder strong refs decreased to zero.
     pub fn strong_refs_hit_zero(&self) -> impl Future<Output = ()> + 'static {
-        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
+        let rx = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.subscribe());
         async move {
             if let Some(mut rx) = rx {
                 let _ = rx.wait_for(|count| *count == 0).await;
@@ -670,7 +691,11 @@ impl<H: TransactionHandler> BinderObjectRef<H> {
     }
     /// Binder strong refs increased from zero to above zero.
     pub fn strong_refs_not_zero(&self) -> impl Future<Output = ()> + 'static {
-        let rx = self.device.object_refcounts.get(&self.id).map(|r| r.subscribe());
+        let rx = self
+            .device
+            .object_refcounts
+            .get(&self.id)
+            .map(|r| r.subscribe());
         async move {
             if let Some(mut rx) = rx {
                 let _ = rx.wait_for(|count| *count != 0).await;
