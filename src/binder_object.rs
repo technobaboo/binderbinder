@@ -254,6 +254,9 @@ impl Drop for WeakBinderRef {
                 },
             );
             self.device
+                .death_notifications
+                .remove(&self.death_notif_cookie);
+            self.device
                 .write_binder_struct_command(BinderCommand::DECREFS, &self.handle());
         }
     }

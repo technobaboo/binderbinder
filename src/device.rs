@@ -1081,10 +1081,9 @@ unsafe fn binder_write_read(
                 _ = write_binder_struct_command(dev_fd, BinderCommand::DEAD_BINDER_DONE, &v);
             }
             BinderReturn::CLEAR_DEATH_NOTIFICATION_DONE => {
-                let v = unsafe {
+                let _v = unsafe {
                     read_from_slice::<BinderUintptrT>(&read_slice[header..], &mut consumed)
                 };
-                device.death_notifications.remove(&v);
                 // TODO: impl?
                 debug!("clear death notif");
             }
