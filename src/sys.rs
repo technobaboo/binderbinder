@@ -4,7 +4,7 @@ use std::os::fd::RawFd;
 use bitflags::bitflags;
 use rustix::ffi::c_void;
 use rustix::ioctl::opcode::{none, read, write};
-use rustix::ioctl::{opcode::read_write, Ioctl};
+use rustix::ioctl::{Ioctl, opcode::read_write};
 use rustix::process::{RawPid, RawUid};
 
 pub type BinderSizeT = usize;

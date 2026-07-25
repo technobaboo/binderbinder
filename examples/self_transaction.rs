@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use binderbinder::{
+    BinderDevice, TransactionHandler,
     device::Transaction,
     payload::{BinderObjectType, PayloadBuilder},
-    BinderDevice, TransactionHandler,
 };
 use tokio::task::spawn_blocking;
 use tracing::{error, info};

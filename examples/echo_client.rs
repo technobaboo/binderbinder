@@ -1,4 +1,4 @@
-use binderbinder::{payload::PayloadBuilder, BinderDevice};
+use binderbinder::{BinderDevice, payload::PayloadBuilder};
 use tokio::task::spawn_blocking;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;

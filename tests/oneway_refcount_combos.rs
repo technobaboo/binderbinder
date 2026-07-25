@@ -117,18 +117,14 @@ async fn create_and_send(device: &Arc<BinderDevice>, code: u32) -> BinderObjectR
 #[test]
 fn oneway_dropped_ref_releases_promptly() {
     let node = PoolNode::acquire();
-    let result = support::fork_combo(
-        &node,
-        become_sink,
-        |device: Arc<BinderDevice>| async move {
-            let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
-            let hit_zero = leaf_ref.strong_refs_hit_zero();
-            drop(leaf_ref);
-            tokio::time::timeout(Duration::from_secs(2), hit_zero)
-                .await
-                .expect("strong_refs_hit_zero did not fire within 2s");
-        },
-    );
+    let result = support::fork_combo(&node, become_sink, |device: Arc<BinderDevice>| async move {
+        let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
+        let hit_zero = leaf_ref.strong_refs_hit_zero();
+        drop(leaf_ref);
+        tokio::time::timeout(Duration::from_secs(2), hit_zero)
+            .await
+            .expect("strong_refs_hit_zero did not fire within 2s");
+    });
     assert!(matches!(
         result.child_status,
         nix::sys::wait::WaitStatus::Exited(_, 0)
@@ -141,32 +137,28 @@ fn oneway_dropped_ref_releases_promptly() {
 #[test]
 fn oneway_held_ref_delays_release_until_dropped() {
     let node = PoolNode::acquire();
-    let result = support::fork_combo(
-        &node,
-        become_sink,
-        |device: Arc<BinderDevice>| async move {
-            let leaf_ref = create_and_send(&device, HOLD_THEN_DROP_CODE).await;
-            let mut hit_zero = Box::pin(leaf_ref.strong_refs_hit_zero());
+    let result = support::fork_combo(&node, become_sink, |device: Arc<BinderDevice>| async move {
+        let leaf_ref = create_and_send(&device, HOLD_THEN_DROP_CODE).await;
+        let mut hit_zero = Box::pin(leaf_ref.strong_refs_hit_zero());
 
-            // Poll (without consuming) a few times while the sink is still
-            // holding its own ref — must stay Pending regardless of what the
-            // sink does, since *we* still hold ours too.
-            let waker = std::task::Waker::noop().clone();
-            let mut cx = std::task::Context::from_waker(&waker);
-            for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                assert!(
-                    hit_zero.as_mut().poll(&mut cx).is_pending(),
-                    "strong_refs_hit_zero fired while we still held our own ref"
-                );
-            }
+        // Poll (without consuming) a few times while the sink is still
+        // holding its own ref — must stay Pending regardless of what the
+        // sink does, since *we* still hold ours too.
+        let waker = std::task::Waker::noop().clone();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                hit_zero.as_mut().poll(&mut cx).is_pending(),
+                "strong_refs_hit_zero fired while we still held our own ref"
+            );
+        }
 
-            drop(leaf_ref);
-            tokio::time::timeout(Duration::from_secs(2), hit_zero)
-                .await
-                .expect("strong_refs_hit_zero did not fire within 2s");
-        },
-    );
+        drop(leaf_ref);
+        tokio::time::timeout(Duration::from_secs(2), hit_zero)
+            .await
+            .expect("strong_refs_hit_zero did not fire within 2s");
+    });
     assert!(matches!(
         result.child_status,
         nix::sys::wait::WaitStatus::Exited(_, 0)
@@ -180,27 +172,23 @@ fn oneway_held_ref_delays_release_until_dropped() {
 #[test]
 fn oneway_concurrent_create_and_drop_cycles() {
     let node = PoolNode::acquire();
-    let result = support::fork_combo(
-        &node,
-        become_sink,
-        |device: Arc<BinderDevice>| async move {
-            let mut tasks = Vec::new();
-            for _ in 0..16 {
-                let device = device.clone();
-                tasks.push(tokio::spawn(async move {
-                    let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
-                    let hit_zero = leaf_ref.strong_refs_hit_zero();
-                    drop(leaf_ref);
-                    tokio::time::timeout(Duration::from_secs(5), hit_zero)
-                        .await
-                        .expect("strong_refs_hit_zero stuck");
-                }));
-            }
-            for t in tasks {
-                t.await.unwrap();
-            }
-        },
-    );
+    let result = support::fork_combo(&node, become_sink, |device: Arc<BinderDevice>| async move {
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let device = device.clone();
+            tasks.push(tokio::spawn(async move {
+                let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
+                let hit_zero = leaf_ref.strong_refs_hit_zero();
+                drop(leaf_ref);
+                tokio::time::timeout(Duration::from_secs(5), hit_zero)
+                    .await
+                    .expect("strong_refs_hit_zero stuck");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+    });
     assert!(matches!(
         result.child_status,
         nix::sys::wait::WaitStatus::Exited(_, 0)
@@ -219,27 +207,23 @@ fn oneway_concurrent_create_and_drop_cycles() {
 #[test]
 fn oneway_owner_and_remote_race_to_drop() {
     let node = PoolNode::acquire();
-    let result = support::fork_combo(
-        &node,
-        become_sink,
-        |device: Arc<BinderDevice>| async move {
-            let mut tasks = Vec::new();
-            for _ in 0..64 {
-                let device = device.clone();
-                tasks.push(tokio::spawn(async move {
-                    let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
-                    let hit_zero = leaf_ref.strong_refs_hit_zero();
-                    drop(leaf_ref);
-                    tokio::time::timeout(Duration::from_secs(5), hit_zero)
-                        .await
-                        .expect("strong_refs_hit_zero stuck");
-                }));
-            }
-            for t in tasks {
-                t.await.unwrap();
-            }
-        },
-    );
+    let result = support::fork_combo(&node, become_sink, |device: Arc<BinderDevice>| async move {
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let device = device.clone();
+            tasks.push(tokio::spawn(async move {
+                let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
+                let hit_zero = leaf_ref.strong_refs_hit_zero();
+                drop(leaf_ref);
+                tokio::time::timeout(Duration::from_secs(5), hit_zero)
+                    .await
+                    .expect("strong_refs_hit_zero stuck");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+    });
     assert!(matches!(
         result.child_status,
         nix::sys::wait::WaitStatus::Exited(_, 0)
@@ -254,42 +238,38 @@ fn oneway_owner_and_remote_race_to_drop() {
 #[test]
 fn oneway_repeated_sends_of_same_object() {
     let node = PoolNode::acquire();
-    let result = support::fork_combo(
-        &node,
-        become_sink,
-        |device: Arc<BinderDevice>| async move {
-            let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
-            let hit_zero = leaf_ref.strong_refs_hit_zero();
+    let result = support::fork_combo(&node, become_sink, |device: Arc<BinderDevice>| async move {
+        let leaf_ref = create_and_send(&device, DROP_IMMEDIATELY_CODE).await;
+        let hit_zero = leaf_ref.strong_refs_hit_zero();
 
-            let mut tasks = Vec::new();
-            for _ in 0..16 {
-                let device = device.clone();
-                let leaf_ref2 = leaf_ref.clone();
-                tasks.push(tokio::spawn(async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut payload = PayloadBuilder::new();
-                        payload.push_binder_ref(&leaf_ref2);
-                        device.transact_one_way(
-                            device.context_manager(),
-                            DROP_IMMEDIATELY_CODE,
-                            payload,
-                        )
-                    })
-                    .await
-                    .unwrap()
-                    .expect("oneway send failed");
-                }));
-            }
-            for t in tasks {
-                t.await.unwrap();
-            }
-
-            drop(leaf_ref);
-            tokio::time::timeout(Duration::from_secs(5), hit_zero)
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let device = device.clone();
+            let leaf_ref2 = leaf_ref.clone();
+            tasks.push(tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut payload = PayloadBuilder::new();
+                    payload.push_binder_ref(&leaf_ref2);
+                    device.transact_one_way(
+                        device.context_manager(),
+                        DROP_IMMEDIATELY_CODE,
+                        payload,
+                    )
+                })
                 .await
-                .expect("strong_refs_hit_zero stuck");
-        },
-    );
+                .unwrap()
+                .expect("oneway send failed");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        drop(leaf_ref);
+        tokio::time::timeout(Duration::from_secs(5), hit_zero)
+            .await
+            .expect("strong_refs_hit_zero stuck");
+    });
     assert!(matches!(
         result.child_status,
         nix::sys::wait::WaitStatus::Exited(_, 0)

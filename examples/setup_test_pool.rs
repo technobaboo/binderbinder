@@ -2,7 +2,7 @@ use std::fs::{remove_file, set_permissions};
 use std::os::unix::fs::PermissionsExt;
 
 use binderbinder::fs::Binderfs;
-use binderbinder::test_pool::{node_path, pool_size, POOL_PREFIX};
+use binderbinder::test_pool::{POOL_PREFIX, node_path, pool_size};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -22,7 +22,10 @@ fn main() {
         let mount = binderbinder::test_pool::mount_path();
         let missing: Vec<_> = (0..size).map(node_path).filter(|p| !p.exists()).collect();
         if missing.is_empty() {
-            println!("OK: all {size} pool nodes present under {}", mount.display());
+            println!(
+                "OK: all {size} pool nodes present under {}",
+                mount.display()
+            );
             std::process::exit(0);
         } else {
             error!("missing pool nodes: {:?}", missing);

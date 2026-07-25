@@ -12,7 +12,7 @@ use binderbinder::device::Transaction;
 use binderbinder::payload::{BinderObjectType, PayloadBuilder};
 use binderbinder::{BinderDevice, TransactionHandler};
 
-use support::{fork_service, kill_child, reap, PoolNode};
+use support::{PoolNode, fork_service, kill_child, reap};
 
 const ECHO_CODE: u32 = 1;
 
@@ -56,7 +56,9 @@ impl TransactionHandler for EchoService {
     async fn handle_one_way(self: Arc<Self>, _transaction: Transaction) {}
 }
 
-async fn become_echo_service(device: Arc<BinderDevice>) -> binderbinder::binder_object::BinderObject<EchoService> {
+async fn become_echo_service(
+    device: Arc<BinderDevice>,
+) -> binderbinder::binder_object::BinderObject<EchoService> {
     let obj = device.register_object(EchoService);
     device
         .set_context_manager(&obj)
@@ -88,7 +90,12 @@ async fn echo_once(device: Arc<BinderDevice>, shape: &'static str, one_way: bool
         } else {
             device
                 .transact_blocking(device.context_manager(), ECHO_CODE, payload)
-                .map(|(_, mut reply)| reply.read_bytes(reply.bytes_until_next_obj()).unwrap().to_vec())
+                .map(|(_, mut reply)| {
+                    reply
+                        .read_bytes(reply.bytes_until_next_obj())
+                        .unwrap()
+                        .to_vec()
+                })
         }
     })
     .await
@@ -96,7 +103,11 @@ async fn echo_once(device: Arc<BinderDevice>, shape: &'static str, one_way: bool
     .expect("transaction failed");
 
     if !one_way {
-        assert_eq!(result, payload_of(shape), "echoed payload didn't round-trip");
+        assert_eq!(
+            result,
+            payload_of(shape),
+            "echoed payload didn't round-trip"
+        );
     }
 }
 

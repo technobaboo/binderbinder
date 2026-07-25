@@ -104,17 +104,16 @@ impl TransactionHandler for RefFactoryService {
     async fn handle_one_way(self: Arc<Self>, _transaction: Transaction) {}
 }
 
-async fn become_ref_factory(device: Arc<BinderDevice>) -> binderbinder::binder_object::BinderObject<RefFactoryService> {
+async fn become_ref_factory(
+    device: Arc<BinderDevice>,
+) -> binderbinder::binder_object::BinderObject<RefFactoryService> {
     let handler = Arc::new(RefFactoryService::default());
     let obj = device.register_object(handler.clone());
     device
         .set_context_manager(&obj)
         .await
         .expect("set_context_manager (service role)");
-    handler
-        .device
-        .set(device)
-        .expect("device set exactly once");
+    handler.device.set(device).expect("device set exactly once");
     obj
 }
 
@@ -128,7 +127,10 @@ async fn create_ref(device: &Arc<BinderDevice>) -> Arc<binderbinder::binder_obje
     .unwrap()
     .expect("create transaction failed");
 
-    match reply.read_binder_ref().expect("expected a binder ref in the reply") {
+    match reply
+        .read_binder_ref()
+        .expect("expected a binder ref in the reply")
+    {
         BinderObjectOrRef::Ref(r) => r,
         other => panic!("expected a remote handle, got {other:?}"),
     }
@@ -159,7 +161,9 @@ async fn wait_until_hit_zero_count(device: &Arc<BinderDevice>, at_least: u32, ti
     })
     .await;
     if result.is_err() {
-        panic!("strong_refs_hit_zero count stuck at {last}, never reached {at_least} within timeout");
+        panic!(
+            "strong_refs_hit_zero count stuck at {last}, never reached {at_least} within timeout"
+        );
     }
 }
 

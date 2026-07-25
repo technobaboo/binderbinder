@@ -14,9 +14,9 @@ use core::slice;
 use dashmap::DashMap;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::{self, Errno};
-use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::process::{self, RawPid, RawUid};
-use std::any::{type_name_of_val, Any};
+use std::any::{Any, type_name_of_val};
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::future::Future;
@@ -31,7 +31,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, trace, trace_span, warn, Instrument};
+use tracing::{Instrument, debug, error, info, instrument, trace, trace_span, warn};
 
 pub struct Transaction {
     pub code: u32,
@@ -963,10 +963,13 @@ unsafe fn binder_write_read(
                     // very next read in the *same* ioctl call (like every other
                     // looper turn does) guarantees the kernel processes this
                     // thread's own queued BR_ACQUIRE immediately, in this call.
-                    match unsafe { binder_write_read(dev_fd, Some(&bytes), &Arc::downgrade(&device), runtime) }
-                    {
+                    match unsafe {
+                        binder_write_read(dev_fd, Some(&bytes), &Arc::downgrade(&device), runtime)
+                    } {
                         Some(Ok(_)) => {
-                            error!("looper unexpectedly received a reply while sending BC_REPLY, ignoring");
+                            error!(
+                                "looper unexpectedly received a reply while sending BC_REPLY, ignoring"
+                            );
                         }
                         Some(Err(e)) => {
                             // The reply never made it out, so no BR_ACQUIRE will
@@ -1071,7 +1074,9 @@ unsafe fn binder_write_read(
                 if let Some((_, death)) = device.death_notifications.remove(&v) {
                     death.cancel();
                 } else {
-                    warn!("got DeadBinder without having internal death_notification registered for it");
+                    warn!(
+                        "got DeadBinder without having internal death_notification registered for it"
+                    );
                 }
                 _ = write_binder_struct_command(dev_fd, BinderCommand::DEAD_BINDER_DONE, &v);
             }
@@ -1154,7 +1159,7 @@ pub trait TransactionHandler: Any + Debug + Send + Sync + 'static {
     /// please whatever you do, copy the data out as soon as absolutly possible and drop the
     /// payload, else this will cause deadlocks and freeze, please, trust me
     fn handle_one_way(self: Arc<Self>, transaction: Transaction)
-        -> impl Future<Output = ()> + Send;
+    -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) trait ErasedTransactionHandler: Any + Debug + Send + Sync + 'static {
@@ -1372,10 +1377,18 @@ mod tests {
 
         // Send A's real BR_ACQUIRE lands.
         state.increase_remote();
-        assert_eq!(*rx.borrow_and_update(), 1, "send A's remote ref is now established");
+        assert_eq!(
+            *rx.borrow_and_update(),
+            1,
+            "send A's remote ref is now established"
+        );
 
         state.decrease_remote();
-        assert_eq!(*rx.borrow_and_update(), 0, "genuinely nothing outstanding now");
+        assert_eq!(
+            *rx.borrow_and_update(),
+            0,
+            "genuinely nothing outstanding now"
+        );
     }
 
     /// Several concurrent sends can all race `mark_pending_remote` while
@@ -1409,7 +1422,11 @@ mod tests {
         // The object genuinely goes away later — must still reach zero,
         // not get stuck on the other two racers' never-consumed credits.
         state.decrease_remote();
-        assert_eq!(*rx.borrow_and_update(), 0, "must reach true zero, not stay stuck");
+        assert_eq!(
+            *rx.borrow_and_update(),
+            0,
+            "must reach true zero, not stay stuck"
+        );
     }
 
     /// Isolates whether the watch/mutex plumbing itself (as opposed to
@@ -1420,7 +1437,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn watch_survives_concurrent_os_thread_hammering() {
         for round in 0..2000 {
-            let id = BinderObjectId { id: round, cookie: 0 };
+            let id = BinderObjectId {
+                id: round,
+                cookie: 0,
+            };
             let state = Arc::new(ObjectRefState::new(id));
             let mut rx = state.subscribe();
 

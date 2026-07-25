@@ -11,6 +11,7 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::{
+    BinderDevice,
     binder_object::{
         BinderObjectId, BinderObjectOrRef, BinderRef, BorrowedBinderObject, ToBinderObjectOrRef,
         WeakBinderObject, WeakBinderRef,
@@ -19,7 +20,6 @@ use crate::{
         BinderBufferFlags, BinderBufferObject, BinderCommand, BinderFdArrayObject, BinderFdObject,
         BinderFdObjectData, BinderObjectHeader, BinderType, FlatBinderObject,
     },
-    BinderDevice,
 };
 pub struct PayloadBuilder<'a> {
     data: Vec<u8>,

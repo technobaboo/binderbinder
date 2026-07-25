@@ -1,10 +1,10 @@
 use crate::{
+    BinderDevice, TransactionHandler,
     device::ErasedTransactionHandler,
     sys::{
         BinderCommand, BinderHandleCookie, BinderObjectHeader, BinderType, BinderUintptrT,
         FlatBinderFlags, FlatBinderObject, FlatBinderObjectData,
     },
-    BinderDevice, TransactionHandler,
 };
 use std::{
     any::Any,
@@ -13,8 +13,8 @@ use std::{
     hash::Hash,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use tokio_util::sync::CancellationToken;

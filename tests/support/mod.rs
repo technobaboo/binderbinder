@@ -24,8 +24,8 @@ use std::sync::Arc;
 use binderbinder::BinderDevice;
 pub use binderbinder::test_pool::PoolNode;
 
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork, pipe, read, write};
 use tracing::Instrument;
 
 /// Debug-only: tag every trace line with role + pid so a full-suite failure's
@@ -50,7 +50,10 @@ fn init_trace_subscriber(role: &str) {
 /// forked service process's exit status (`WaitStatus::Exited(_, 0)` is
 /// success — anything else means the service role panicked or was killed).
 pub struct ComboResult<T> {
-    #[allow(dead_code, reason = "not every combo test needs the client role's return value")]
+    #[allow(
+        dead_code,
+        reason = "not every combo test needs the client role's return value"
+    )]
     pub client: T,
     pub child_status: WaitStatus,
 }
