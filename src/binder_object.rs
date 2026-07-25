@@ -142,6 +142,9 @@ impl Drop for BinderRef {
             self.device
                 .write_binder_struct_command(BinderCommand::RELEASE, &self.handle());
         }
+        self.device
+            .refs
+            .remove_if(&self.handle(), |_, v| v.strong_count() == 0);
     }
 }
 
@@ -259,6 +262,9 @@ impl Drop for WeakBinderRef {
             self.device
                 .write_binder_struct_command(BinderCommand::DECREFS, &self.handle());
         }
+        self.device
+            .weak_refs
+            .remove_if(&self.handle(), |_, v| v.strong_count() == 0);
     }
 }
 
