@@ -287,6 +287,7 @@ pub struct BorrowedBinderObject {
     device: Arc<BinderDevice>,
     id: BinderObjectId,
     handler: Arc<dyn ErasedTransactionHandler>,
+    increased_local_ref: bool,
 }
 
 impl Debug for BorrowedBinderObject {
@@ -299,13 +300,16 @@ impl Debug for BorrowedBinderObject {
 
 impl Clone for BorrowedBinderObject {
     fn clone(&self) -> Self {
+        let mut increased_local_ref = false;
         if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
             refstate.increase_local();
+            increased_local_ref = true;
         }
         Self {
             device: self.device.clone(),
             id: self.id,
             handler: self.handler.clone(),
+            increased_local_ref,
         }
     }
 }
@@ -318,7 +322,9 @@ impl TransactionTargetImpl for BorrowedBinderObject {
 impl Drop for BorrowedBinderObject {
     fn drop(&mut self) {
         tracing::trace!(?self.id, "Dropping BorrowedBinderObject");
-        if let Some(refstate) = self.device.object_refcounts.get(&self.id) {
+        if self.increased_local_ref
+            && let Some(refstate) = self.device.object_refcounts.get(&self.id)
+        {
             refstate.decrease_local();
         }
     }
@@ -327,13 +333,16 @@ impl Drop for BorrowedBinderObject {
 impl BorrowedBinderObject {
     pub(crate) fn from_id(dev: Arc<BinderDevice>, id: BinderObjectId) -> Option<Self> {
         let handler = dev.get_handler(&id)?;
-        let refstate = dev.object_refcounts.get(&id)?;
-        refstate.increase_local();
-        drop(refstate);
+        let mut increased_local_ref = false;
+        if let Some(refstate) = dev.object_refcounts.get(&id) {
+            refstate.increase_local();
+            increased_local_ref = true;
+        }
         Some(BorrowedBinderObject {
             device: dev,
             id,
             handler,
+            increased_local_ref,
         })
     }
     pub fn downgrade(&self) -> WeakBinderObject {
@@ -608,13 +617,16 @@ pub trait ToBinderObjectOrRef: Send + Sync + 'static {
 }
 impl<H: TransactionHandler> ToBinderObjectOrRef for BinderObject<H> {
     fn to_binder_object_or_ref(&self) -> BinderObjectOrRef {
+        let mut increased_local_ref = false;
         if let Some(ref_state) = self.device.object_refcounts.get(&self.id) {
             ref_state.increase_local();
+            increased_local_ref = true;
         }
         BinderObjectOrRef::Object(BorrowedBinderObject {
             device: self.device.clone(),
             id: self.id,
             handler: self.handler.clone(),
+            increased_local_ref,
         })
     }
 }
