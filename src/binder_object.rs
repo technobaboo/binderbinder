@@ -12,6 +12,7 @@ use std::{
     future::Future,
     hash::Hash,
     ops::Deref,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -52,6 +53,17 @@ impl BinderObjectOrRef {
             BinderObjectOrRef::WeakObject(p) => &p.device,
             BinderObjectOrRef::Ref(p) => &p.device,
             BinderObjectOrRef::WeakRef(p) => &p.device,
+        }
+    }
+    /// future returns when the remote object died. If this is an object (we own it locally),
+    /// it can never die from our own perspective, so the future never completes.
+    pub fn death_notification(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        match self {
+            BinderObjectOrRef::Object(_) | BinderObjectOrRef::WeakObject(_) => {
+                Box::pin(std::future::pending())
+            }
+            BinderObjectOrRef::Ref(p) => Box::pin(p.death_notification()),
+            BinderObjectOrRef::WeakRef(p) => Box::pin(p.death_notification()),
         }
     }
 }
